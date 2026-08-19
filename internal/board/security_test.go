@@ -422,5 +422,10 @@ func TestReapReportsTheStateItActuallyLeftTheTaskIn(t *testing.T) {
 		if got.State != onDisk.State {
 			t.Errorf("%s: reported as %s, actually %s", got.ID, got.State, onDisk.State)
 		}
+		// The caller's whole message is "worker X is gone", so the name has to survive on
+		// the copy handed back even where the file no longer carries it.
+		if got.Agent == "" {
+			t.Errorf("%s: reaped without saying which worker was gone", got.ID)
+		}
 	}
 }

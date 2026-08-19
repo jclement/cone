@@ -511,7 +511,7 @@ func cmdReap(args []string) error {
 		if *dry {
 			verb = "would release"
 		}
-		fmt.Printf("%s %s (claimed by %s)\n", verb, t.ID, t.ClaimedBy)
+		fmt.Printf("%s %s (worker %s is gone) → %s\n", verb, t.ID, t.Agent, t.State)
 	}
 	return nil
 }

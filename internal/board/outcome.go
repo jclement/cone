@@ -215,10 +215,13 @@ func (b *Board) Reap(herdrBin string, dryRun bool) ([]*Task, error) {
 			if _, err := b.Release(t.ID); err != nil {
 				continue
 			}
-			// Release works on its own loaded copy, so say what actually happened: the
-			// caller logs t.State, and reporting the state we just moved away from is how a
-			// log line ends up contradicting the board it is describing.
-			t.State, t.ClaimedBy, t.ClaimedAt, t.Agent = Ready, "", time.Time{}, ""
+			// Release works on its own loaded copy, so correct the state we hand back: the
+			// caller logs it, and reporting the state we just moved away from is how a log
+			// line ends up contradicting the board it describes. Agent and claimant are
+			// deliberately LEFT on this copy even though the file no longer carries them —
+			// "worker %q is gone" is the whole message, and a caller reading it off a
+			// cleared struct prints an empty name.
+			t.State = Ready
 		} else if err := b.move(t, to); err != nil {
 			// Blocked keeps the claim stamps: it is not unowned, it is waiting on a human.
 			continue
