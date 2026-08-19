@@ -34,6 +34,7 @@ func TestPathsInFindsTheBinariesAUnitRuns(t *testing.T) {
 // Zero bytes is the signature of the bug: loaded, retried every 30 seconds, silent throughout.
 // "Loaded" is not "working".
 func TestAnEmptyWatchLogIsReportedAsNeverHavingRun(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // this machine's real unit must not decide the outcome
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".watch.log"), nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -46,5 +47,23 @@ func TestAnEmptyWatchLogIsReportedAsNeverHavingRun(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("an empty watch log was not reported as a heartbeat that has never run")
+	}
+}
+
+// With no scheduler installed at all — a CI runner, a fresh checkout — doctor must still get
+// as far as the board's own evidence. An early return here made it silent on the more useful
+// half of the check.
+func TestDoctorStillChecksTheLogWithNoSchedulerInstalled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no unit anywhere: exactly the CI case that caught this
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".watch.log"), []byte("2026-08-19T16:00:00Z watching\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var areas []string
+	for _, f := range Doctor(root) {
+		areas = append(areas, f.Area)
+	}
+	if !strings.Contains(strings.Join(areas, " "), "heartbeat") {
+		t.Fatalf("doctor stopped at the scheduler and never looked at the log (areas: %v)", areas)
 	}
 }

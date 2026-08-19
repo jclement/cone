@@ -21,34 +21,36 @@ import (
 // pass. .watch.log was zero bytes for weeks and nobody looked, because nothing suggested
 // looking. "Loaded" is not "working", so this checks the paths and the log.
 func Doctor(root string) []board.Finding {
-	var out []Finding
-	_ = out
 	var f []board.Finding
 
+	// Each stage records what it found and moves on. An early return here meant that on a
+	// machine with no scheduler installed — a CI runner, a fresh checkout — doctor never got
+	// as far as looking at the board's own evidence, which is the more useful half.
 	unit, kind := unitPath()
-	if unit == "" {
-		return []board.Finding{{Severity: board.Warn, Area: "scheduler",
-			Message: fmt.Sprintf("no scheduler support on %s — run `cone watch` yourself", runtime.GOOS)}}
-	}
-	data, err := os.ReadFile(unit)
-	if err != nil {
-		return []board.Finding{{Severity: board.Warn, Area: "scheduler",
+	data, err := readUnit(unit)
+	switch {
+	case unit == "":
+		f = append(f, board.Finding{Severity: board.Warn, Area: "scheduler",
+			Message: fmt.Sprintf("no scheduler support on %s — run `cone watch` yourself", runtime.GOOS)})
+	case err != nil:
+		f = append(f, board.Finding{Severity: board.Warn, Area: "scheduler",
 			Message: "the heartbeat is not installed — nothing wakes an orchestrator when work arrives",
-			Fix:     "cone install"}}
+			Fix:     "cone install"})
+	default:
+		f = append(f, board.Finding{Severity: board.OK, Area: "scheduler", Message: kind + ": " + unit})
 	}
-	f = append(f, board.Finding{Severity: board.OK, Area: "scheduler", Message: kind + ": " + unit})
 
 	// Every absolute path the unit names must exist. A path baked in at install time and
 	// deleted by an upgrade is the exact failure mode here: brew upgrade removes the Cellar
 	// directory a resolved symlink pointed into, and the scheduler retries it forever.
-	for _, p := range pathsIn(string(data)) {
+	for _, p := range pathsIn(data) {
 		if _, err := os.Stat(p); err != nil {
 			f = append(f, board.Finding{Severity: board.Broken, Area: "scheduler",
 				Message: fmt.Sprintf("the unit runs %s, which does not exist — the heartbeat cannot work", p),
 				Fix:     "cone install"})
 		}
 	}
-	if !strings.Contains(string(data), "herdr") {
+	if data != "" && !strings.Contains(data, "herdr") {
 		f = append(f, board.Finding{Severity: board.Broken, Area: "scheduler",
 			Message: "the unit names no herdr binary, so a bare `herdr` is resolved against launchd's PATH — which has no Homebrew in it",
 			Fix:     "cone install"})
@@ -79,6 +81,15 @@ func Doctor(root string) []board.Finding {
 }
 
 type Finding = board.Finding
+
+// readUnit returns the unit file's contents, or "" when there is no unit to read.
+func readUnit(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(path)
+	return string(data), err
+}
 
 func unitPath() (path, kind string) {
 	home, _ := os.UserHomeDir()
