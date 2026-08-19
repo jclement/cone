@@ -386,3 +386,41 @@ func fakeHerdrBin(t *testing.T, agentsJSON string) string {
 	}
 	return bin
 }
+
+// Reap's caller logs the task it hands back, so a stale State there produces a log line that
+// contradicts the board it is describing — "worker gone; it is now doing" for a task that is
+// sitting in ready/.
+func TestReapReportsTheStateItActuallyLeftTheTaskIn(t *testing.T) {
+	bin := fakeHerdrBin(t, `{"result":{"agents":[]}}`)
+
+	b := tmpBoard(t)
+	gone, _ := b.New(Task{Title: "nothing to show"})
+	b.Promote(gone.ID)
+	b.Claim(gone.ID, "lead")
+	b.Set(gone.ID, "agent", "dead-worker")
+
+	finished, _ := b.New(Task{Title: "finished overnight"})
+	b.Promote(finished.ID)
+	b.Claim(finished.ID, "lead")
+	b.Set(finished.ID, "agent", "dead-worker-2")
+	if _, err := b.Snapshot(finished.ID, "EXIT=0\nall green\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	reaped, err := b.Reap(bin, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 2 {
+		t.Fatalf("reaped %d, want 2", len(reaped))
+	}
+	for _, got := range reaped {
+		onDisk, err := b.Find(got.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != onDisk.State {
+			t.Errorf("%s: reported as %s, actually %s", got.ID, got.State, onDisk.State)
+		}
+	}
+}

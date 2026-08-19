@@ -215,6 +215,10 @@ func (b *Board) Reap(herdrBin string, dryRun bool) ([]*Task, error) {
 			if _, err := b.Release(t.ID); err != nil {
 				continue
 			}
+			// Release works on its own loaded copy, so say what actually happened: the
+			// caller logs t.State, and reporting the state we just moved away from is how a
+			// log line ends up contradicting the board it is describing.
+			t.State, t.ClaimedBy, t.ClaimedAt, t.Agent = Ready, "", time.Time{}, ""
 		} else if err := b.move(t, to); err != nil {
 			// Blocked keeps the claim stamps: it is not unowned, it is waiting on a human.
 			continue
