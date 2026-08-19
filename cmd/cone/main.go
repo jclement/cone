@@ -66,7 +66,6 @@ RUN
   cone watch                  the heartbeat: wake an idle orchestrator when work appears
   cone sync                   pull tasks from configured inboxes
   cone mcp                    stdio MCP server (for claude mcp add)
-  cone serve [-addr :7788]    HTTP MCP server (for remote agents)
   cone install                install skills + the platform scheduler
   cone update [--check]       verified in-place upgrade to the latest release
   cone version
@@ -150,8 +149,6 @@ func run(args []string) error {
 		return cmdWatch(rest)
 	case "mcp":
 		return cmdMCP()
-	case "serve":
-		return cmdServe(rest)
 	case "install":
 		return install.Run(rest)
 	case "update":
@@ -715,9 +712,12 @@ func cmdSync() error {
 	if err != nil {
 		return err
 	}
-	sources := inbox.FromEnv()
+	sources, err := inbox.Configured()
+	if err != nil {
+		return err
+	}
 	if len(sources) == 0 {
-		fmt.Println("no inboxes configured on this host (nothing to do)")
+		fmt.Printf("no inboxes configured (declare them in %s)\n", inbox.ConfigPath())
 		return nil
 	}
 	names := make([]string, len(sources))
@@ -782,18 +782,6 @@ func cmdMCP() error {
 		return err
 	}
 	return mcpsrv.ServeStdio(b)
-}
-
-func cmdServe(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:7788", "listen address")
-	token := fs.String("token", os.Getenv("CONE_TOKEN"), "bearer token required from clients")
-	fs.Parse(reorder(fs, args))
-	b, err := open()
-	if err != nil {
-		return err
-	}
-	return mcpsrv.ServeHTTP(b, *addr, *token)
 }
 
 func shortDur(d time.Duration) string {

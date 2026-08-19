@@ -93,25 +93,45 @@ cone                               # the TUI
 | `cone tui` | interactive board (also the default with no args) |
 | `cone watch` | the heartbeat |
 | `cone sync` | pull tasks from configured inboxes |
-| `cone mcp` · `serve` | MCP over stdio · over HTTP |
+| `cone mcp` | MCP over stdio |
 | `cone doctor` | why did nothing happen? Checks the board *and* the heartbeat |
 | `cone install` | board, scheduler, index |
 | `cone update [--check]` | verified upgrade to the latest release |
 
 ## Inboxes
 
-The board is the system of record; an inbox is *a* way tasks arrive. Meat Prompt and herdrer
-are supported out of the box and detected from the environment or
-`~/.config/<service>/env` — a host with neither configured simply syncs nothing.
+The board is the system of record; an inbox is *a* way tasks arrive — for when a human queues
+something somewhere else (a phone, a web form) and wants an agent to pick it up.
 
-Deduplication is by upstream id across **every** state, so re-running never double-files.
-Adding a source means implementing one interface.
+**cone knows about no particular service.** Sources are declared in
+`~/.config/cone/inboxes.json`, so a change to somebody else's API is a config edit rather than
+a cone release:
+
+```json
+[
+  {
+    "name":       "phone-queue",
+    "url":        "https://queue.example.com",
+    "claim_path": "/api/v1/tasks/claim",
+    "token_file": "~/.config/phone-queue/env",
+    "token_key":  "PHONE_QUEUE_TOKEN"
+  }
+]
+```
+
+A source needs one endpoint: a GET that hands the caller one queued task and returns `204` when
+there are none. `token` and `token_env` work in place of `token_file`. No file means no inboxes,
+which is the common case and costs nothing — but a file that exists and is wrong is an error,
+because silently syncing nothing is indistinguishable from an empty queue.
+
+Deduplication is by upstream id across **every** state, so re-running never double-files. These
+endpoints hand a task to exactly one caller, so a fetch is destructive: anything that cannot
+then be filed lands in `inbox-quarantine/` rather than disappearing, and `cone doctor` says so.
 
 ## MCP
 
 ```sh
-claude mcp add cone -- $(which cone) mcp        # local: no auth, no port
-CONE_TOKEN=… cone serve -addr 127.0.0.1:7788    # remote agents
+claude mcp add cone -- $(which cone) mcp        # stdio: no auth, no port
 ```
 
 Eight tools: `cone_ls`, `cone_show`, `cone_claim`, `cone_new`, `cone_update`, `cone_search`,
@@ -167,7 +187,7 @@ broken, so it can be scripted.
 |---|---|---|
 | `CONE_HOME` | `~/cone` | board root |
 | `CONE_AGENT` | `$HERDR_AGENT`, else hostname | who claims |
-| `CONE_TOKEN` | — | bearer token for `cone serve` |
+| `CONE_INBOXES` | `~/.config/cone/inboxes.json` | where sources are declared |
 | `CONE_HERDR` | `herdr` on `PATH` | which herdr the heartbeat wakes |
 | `CONE_NO_UPDATE_CHECK` | — | set to anything to silence the update check |
 

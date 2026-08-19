@@ -1,9 +1,11 @@
 // Package inbox pulls tasks from outside sources into the board.
 //
 // The board is the system of record. An inbox is *a* way tasks arrive — not the only one,
-// and never the place work lives. Meat Prompt is one source; herdrer on another host is a
-// second; the CLI and the MCP server file directly. Adding a third source should mean
-// implementing one interface, not touching the board.
+// and never the place work lives. The CLI and the MCP server file directly; an inbox is for
+// the case where a human queues something somewhere else — a phone, a web form — and wants an
+// agent to pick it up. cone knows about no particular service: sources are declared in
+// ~/.config/cone/inboxes.json, so a change to somebody else's API is a config edit, not a
+// cone release.
 //
 // Every source is pull-based and idempotent: it is asked "what is new since X" and returns
 // tasks carrying a stable SourceRef, so re-running never duplicates. That matters more than
@@ -125,11 +127,140 @@ func seenRefs(b *board.Board) (map[string]bool, error) {
 	return seen, nil
 }
 
-// ── Meat Prompt / herdrer ────────────────────────────────────────────────────────────
+// ── Configured sources ───────────────────────────────────────────────────────────────
 //
-// Both expose the same shape for the reverse channel: the human queues something, an agent
-// claims it. They differ in path (/api/v1/tasks/claim vs /api/v1/agent/tasks/claim), so the
-// path is configuration rather than two near-identical implementations.
+// cone knows about no particular service, deliberately. Two named integrations used to be
+// compiled in — their URLs, their claim paths, the layout of their credential files — which
+// made this package a place other people's APIs go to rot: a path change upstream became a
+// cone release. A source is configuration now.
+//
+//	~/.config/cone/inboxes.json
+//	[
+//	  {
+//	    "name":       "phone-queue",
+//	    "url":        "https://queue.example.com",
+//	    "claim_path": "/api/v1/tasks/claim",
+//	    "token_file": "~/.config/phone-queue/env",
+//	    "token_key":  "PHONE_QUEUE_TOKEN"
+//	  }
+//	]
+//
+// A source needs one endpoint: a GET that hands the caller one queued task and returns 204
+// when there are none. `token` and `token_env` work in place of `token_file`. No file, or an
+// empty list, means this host syncs nothing — which is the common case and costs nothing.
+
+// Config is one entry in inboxes.json.
+type Config struct {
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	ClaimPath string `json:"claim_path"`
+	Token     string `json:"token"`
+	TokenEnv  string `json:"token_env"`
+	TokenFile string `json:"token_file"`
+	TokenKey  string `json:"token_key"`
+}
+
+// ConfigPath is where sources are declared. $CONE_INBOXES overrides it.
+func ConfigPath() string {
+	if p := os.Getenv("CONE_INBOXES"); p != "" {
+		return p
+	}
+	cfg := os.Getenv("XDG_CONFIG_HOME")
+	if cfg == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "inboxes.json"
+		}
+		cfg = filepath.Join(home, ".config")
+	}
+	return filepath.Join(cfg, "cone", "inboxes.json")
+}
+
+// Configured reads the source list. A missing file is not an error: most hosts have none.
+// A file that exists and cannot be read IS an error — a typo that silently syncs nothing is
+// indistinguishable from a queue that happens to be empty.
+func Configured() ([]Source, error) {
+	data, err := os.ReadFile(ConfigPath())
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cfgs []Config
+	if err := json.Unmarshal(data, &cfgs); err != nil {
+		return nil, fmt.Errorf("%s: %w", ConfigPath(), err)
+	}
+
+	var out []Source
+	for _, c := range cfgs {
+		if c.Name == "" || c.URL == "" {
+			return nil, fmt.Errorf("%s: every inbox needs a name and a url", ConfigPath())
+		}
+		if c.ClaimPath == "" {
+			return nil, fmt.Errorf("%s: inbox %q needs a claim_path", ConfigPath(), c.Name)
+		}
+		token, err := c.token()
+		if err != nil {
+			return nil, fmt.Errorf("inbox %q: %w", c.Name, err)
+		}
+		if token == "" {
+			return nil, fmt.Errorf("inbox %q: no token (set token, token_env or token_file)", c.Name)
+		}
+		out = append(out, &HTTPSource{
+			SourceName: c.Name, BaseURL: c.URL, Token: token, ClaimPath: c.ClaimPath,
+		})
+	}
+	return out, nil
+}
+
+func (c Config) token() (string, error) {
+	if c.Token != "" {
+		return c.Token, nil
+	}
+	if c.TokenEnv != "" {
+		return os.Getenv(c.TokenEnv), nil
+	}
+	if c.TokenFile == "" {
+		return "", nil
+	}
+	path := c.TokenFile
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, path[2:])
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	// A KEY=VALUE file, which is what every service's enrollment writes. Without a token_key
+	// the first value wins, so a single-line file needs no extra configuration.
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		if c.TokenKey == "" || strings.TrimSpace(k) == c.TokenKey {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("%s has no %s", path, orDefault(c.TokenKey, "usable KEY=VALUE line"))
+}
+
+func orDefault(s, d string) string {
+	if s == "" {
+		return d
+	}
+	return s
+}
 
 type HTTPSource struct {
 	SourceName string
@@ -222,53 +353,4 @@ func firstLine(s string) string {
 		return "untitled task"
 	}
 	return s
-}
-
-// FromEnv builds whichever sources this host is actually configured for. A host with neither
-// service configured gets an empty list and syncs nothing, which is correct — cone is useful
-// with no inboxes at all.
-func FromEnv() []Source {
-	var out []Source
-	if u, t := readCreds("MEATPROMPT"); u != "" && t != "" {
-		out = append(out, &HTTPSource{SourceName: "meatprompt", BaseURL: u, Token: t, ClaimPath: "/api/v1/tasks/claim"})
-	}
-	if u, t := readCreds("HERDRER"); u != "" && t != "" {
-		out = append(out, &HTTPSource{SourceName: "herdrer", BaseURL: u, Token: t, ClaimPath: "/api/v1/agent/tasks/claim"})
-	}
-	return out
-}
-
-// readCreds checks the environment, then the conventional credentials file, so a source works
-// whether it was enrolled by a script or exported by a shell.
-func readCreds(prefix string) (url, token string) {
-	url, token = os.Getenv(prefix+"_URL"), os.Getenv(prefix+"_TOKEN")
-	if url != "" && token != "" {
-		return
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	cfg := os.Getenv("XDG_CONFIG_HOME")
-	if cfg == "" {
-		cfg = home + "/.config"
-	}
-	data, err := os.ReadFile(cfg + "/" + strings.ToLower(prefix) + "/env")
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if !ok || strings.HasPrefix(k, "#") {
-			continue
-		}
-		v = strings.Trim(v, `"'`)
-		switch k {
-		case prefix + "_URL":
-			url = v
-		case prefix + "_TOKEN":
-			token = v
-		}
-	}
-	return
 }

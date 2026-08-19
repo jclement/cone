@@ -83,3 +83,67 @@ func contains(haystack, needle string) bool {
 		return false
 	})()
 }
+
+// cone compiled in two named services — their URLs, their claim paths, the layout of their
+// credential files — which made a path change upstream into a cone release. Sources are
+// configuration; the code knows about none of them.
+func TestSourcesComeFromConfigurationNotFromCompiledInServices(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "env")
+	os.WriteFile(tokenFile, []byte("# a comment\nSOME_SERVICE_TOKEN=\"sk_live_abc\"\n"), 0o600)
+
+	cfg := filepath.Join(dir, "inboxes.json")
+	os.WriteFile(cfg, []byte(`[{
+	  "name": "phone-queue",
+	  "url": "https://queue.example.com",
+	  "claim_path": "/api/v1/tasks/claim",
+	  "token_file": "`+tokenFile+`",
+	  "token_key": "SOME_SERVICE_TOKEN"
+	}]`), 0o644)
+	t.Setenv("CONE_INBOXES", cfg)
+
+	got, err := Configured()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d sources, want 1", len(got))
+	}
+	h, ok := got[0].(*HTTPSource)
+	if !ok {
+		t.Fatalf("got %T", got[0])
+	}
+	if h.SourceName != "phone-queue" || h.BaseURL != "https://queue.example.com" ||
+		h.ClaimPath != "/api/v1/tasks/claim" || h.Token != "sk_live_abc" {
+		t.Fatalf("source did not come through as declared: %+v", h)
+	}
+}
+
+// Most hosts have no inbox at all, and that must cost nothing and say nothing.
+func TestNoConfigFileIsNotAnError(t *testing.T) {
+	t.Setenv("CONE_INBOXES", filepath.Join(t.TempDir(), "absent.json"))
+	got, err := Configured()
+	if err != nil || len(got) != 0 {
+		t.Fatalf("a host with no inboxes got (%v, %v)", got, err)
+	}
+}
+
+// A file that exists and is wrong must not silently sync nothing — that is indistinguishable
+// from a queue that happens to be empty, which is how a broken integration goes unnoticed.
+func TestABrokenConfigIsReportedNotIgnored(t *testing.T) {
+	for _, c := range []struct{ name, body string }{
+		{"not json", `{`},
+		{"no url", `[{"name":"x","claim_path":"/c","token":"t"}]`},
+		{"no claim path", `[{"name":"x","url":"https://e.example","token":"t"}]`},
+		{"no token", `[{"name":"x","url":"https://e.example","claim_path":"/c"}]`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "inboxes.json")
+			os.WriteFile(p, []byte(c.body), 0o644)
+			t.Setenv("CONE_INBOXES", p)
+			if _, err := Configured(); err == nil {
+				t.Fatal("a broken inbox config was accepted, and this host now syncs nothing in silence")
+			}
+		})
+	}
+}
