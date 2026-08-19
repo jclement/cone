@@ -269,3 +269,32 @@ func TestAFinishedAgentIsNotTreatedAsIdle(t *testing.T) {
 		t.Fatal("prompted an agent that had already finished")
 	}
 }
+
+// Confirmation is ambiguous in one direction: an agent that takes the turn and finishes it
+// inside the same second reads exactly like one that never started. Retrying forever would
+// prompt a healthy lead about the same tasks every interval, for good.
+func TestAnUnconfirmablePokeIsNotRetriedForever(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	// Accepts the prompt and reports idle afterwards, every time.
+	os.WriteFile(bin, []byte(`#!/bin/sh
+echo "$@" >> "`+dir+`/calls"
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\n' ;;
+  "agent list") printf '{"result":{"agents":[{"name":"lead","agent_status":"idle","cwd":"/tmp/x"}]}}\n' ;;
+esac
+`), 0o755)
+	b := boardWith(t, board.Task{Title: "one thing"})
+	w := New(b, Options{HerdrBin: bin})
+
+	for i := 0; i < 6; i++ {
+		w.Tick(context.Background())
+	}
+
+	if n := strings.Count(calls(t, dir), "agent prompt"); n > maxPokeAttempts {
+		t.Fatalf("prompted %d times about the same set; the cap is %d", n, maxPokeAttempts)
+	}
+	if len(w.poked) == 0 {
+		t.Fatal("gave up without recording the set, so it will nag again after a restart")
+	}
+}

@@ -92,11 +92,19 @@ type Watcher struct {
 
 	complaint string // the last thing that stopped a poke
 	since     time.Time
+
+	// tries counts unconfirmed pokes per agent+signature. Confirmation is not free of
+	// ambiguity — an agent that takes the turn and finishes it inside the same second reads
+	// as "still idle", i.e. as a prompt that never landed — so retrying forever would nag a
+	// perfectly healthy lead every interval. Bounded retries, then take the win.
+	tries map[string]int
 }
+
+const maxPokeAttempts = 3
 
 func New(b *board.Board, opt Options) *Watcher {
 	opt.defaults()
-	w := &Watcher{b: b, opt: opt, poked: map[string]string{}, log: func(string, ...any) {}}
+	w := &Watcher{b: b, opt: opt, poked: map[string]string{}, tries: map[string]int{}, log: func(string, ...any) {}}
 	if opt.Verbose {
 		w.log = w.say
 	}
@@ -205,12 +213,22 @@ is worse than an unclaimed one.)`, w.opt.Prompt, len(mine), inFlight, w.opt.MaxW
 			return
 		}
 		if err := w.poke(ctx, c.session, c.name, msg); err != nil {
-			w.hold("prompt to %s did not land: %v", c.name, err)
-			return
+			attempt := c.name + "\x00" + sig
+			w.tries[attempt]++
+			if w.tries[attempt] < maxPokeAttempts {
+				w.hold("prompt to %s did not land: %v", c.name, err)
+				return
+			}
+			// Three unconfirmed attempts: either it is landing and finishing faster than we
+			// can observe, or it never will. Both are better served by moving on than by
+			// prompting the same lead about the same tasks every interval forever.
+			w.say("prompt to %s could not be confirmed after %d attempts (%v) — recording it anyway",
+				c.name, maxPokeAttempts, err)
 		}
 		// Only now: a signature recorded for a prompt that never arrived means this exact
 		// set is never mentioned again, which is the worst possible failure for a queue.
 		w.poked[c.name] = sig
+		delete(w.tries, c.name+"\x00"+sig)
 		w.saveState()
 		w.clear()
 		w.say("poked %s (session %q) about %d ready task(s)", c.name, c.session, len(mine))
