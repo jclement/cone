@@ -25,7 +25,11 @@ import (
 	"github.com/jclement/cone/internal/watch"
 )
 
-var version = "dev"
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
 
 const usage = `cone — the agent coordination board
 
@@ -98,7 +102,7 @@ func run(args []string) error {
 		fmt.Print(usage)
 		return nil
 	case "version", "--version":
-		fmt.Println("cone " + version)
+		fmt.Printf("cone %s (%s, built %s)\n", version, commit, buildDate)
 		return nil
 	case "new":
 		return cmdNew(rest)

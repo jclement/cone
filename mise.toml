@@ -34,3 +34,54 @@ depends = ["lint", "test"]
 [tasks.install]
 description = "Build, install to ~/.local/bin, and wire the platform scheduler"
 run = ["mise run build", "./dist/cone install"]
+
+[tasks.release]
+description = "Interactive release: bump version, tag, and push"
+run = """
+#!/bin/bash
+set -e
+
+CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+echo "Current version: $CURRENT_TAG"
+
+VERSION_NUM=${CURRENT_TAG#v}
+IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NUM"
+
+NEXT_PATCH="v$MAJOR.$MINOR.$((PATCH + 1))"
+NEXT_MINOR="v$MAJOR.$((MINOR + 1)).0"
+NEXT_MAJOR="v$((MAJOR + 1)).0.0"
+
+echo ""
+echo "Select release type:"
+echo "  1) patch  → $NEXT_PATCH"
+echo "  2) minor  → $NEXT_MINOR"
+echo "  3) major  → $NEXT_MAJOR"
+echo "  q) quit"
+echo ""
+read -p "Choice [1]: " CHOICE
+CHOICE=${CHOICE:-1}
+
+case $CHOICE in
+    1) NEW_VERSION=$NEXT_PATCH ;;
+    2) NEW_VERSION=$NEXT_MINOR ;;
+    3) NEW_VERSION=$NEXT_MAJOR ;;
+    q|Q) echo "Cancelled."; exit 0 ;;
+    *) echo "Invalid choice"; exit 1 ;;
+esac
+
+echo ""
+echo "Creating release: $NEW_VERSION"
+git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
+echo "Created tag: $NEW_VERSION"
+
+read -p "Push tag to origin? [Y/n]: " CONFIRM
+CONFIRM=${CONFIRM:-Y}
+if [[ ! $CONFIRM =~ ^[Yy]$ ]]; then
+    git tag -d "$NEW_VERSION" >/dev/null 2>&1
+    echo "Cancelled. Tag removed."
+    exit 0
+fi
+
+git push origin "$NEW_VERSION"
+echo "Tag pushed! GitHub Actions will build and release."
+"""

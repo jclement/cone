@@ -1,0 +1,65 @@
+version: 2
+
+project_name: cone
+
+builds:
+  - id: cone
+    main: ./cmd/cone
+    binary: cone
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.buildDate={{.Date}}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Keyless cosign over the checksums file. Self-update verifies this bundle, so it is not
+# optional — an unverified download must never be installable.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+    artifacts: checksum
+    output: true
+
+brews:
+  - directory: Formula
+    repository:
+      owner: jclement
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    name: cone
+    homepage: "https://github.com/jclement/cone"
+    description: "A coordination board for coding agents — a folder is the protocol"
+    license: "MIT"
+    install: |
+      bin.install "cone"
+    test: |
+      system "#{bin}/cone", "version"
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^ci:"]
+
+release:
+  github:
+    owner: jclement
+    name: cone
+  draft: false
+  prerelease: auto
