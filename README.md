@@ -89,6 +89,7 @@ cone                               # the TUI
 | `cone watch` | the heartbeat |
 | `cone sync` | pull tasks from configured inboxes |
 | `cone mcp` · `serve` | MCP over stdio · over HTTP |
+| `cone doctor` | why did nothing happen? Checks the board *and* the heartbeat |
 | `cone install` | board, scheduler, index |
 | `cone update [--check]` | verified upgrade to the latest release |
 
@@ -133,6 +134,19 @@ rename, so an interrupted update leaves the old cone intact.
 
 Inside a container it refuses and tells you to pull a newer image; a Homebrew install is left
 to `brew upgrade cone`.
+
+## When it looks like nothing is happening
+
+```sh
+cone doctor
+```
+
+It reads every task file directly rather than through the board, because `List` skips what it
+cannot parse — a broken task is invisible exactly when you are asking why it never came up. It
+also checks the half that lives outside the board: that the scheduler unit exists, that every
+absolute path it names still does (a `brew upgrade` used to delete one), and that the watcher
+has actually written to its log. **"Loaded" is not "working."** Exit code 1 when something is
+broken, so it can be scripted.
 
 ## What this is not
 

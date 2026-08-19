@@ -59,6 +59,7 @@ MESSAGES
 FIND
   cone search <query>         full-text over tasks and messages
   cone reindex                rebuild the index from disk
+  cone doctor                 why did nothing happen? Checks the board and the heartbeat
 
 RUN
   cone tui                    interactive board
@@ -139,6 +140,8 @@ func run(args []string) error {
 		return cmdRead(rest)
 	case "search":
 		return cmdSearch(rest)
+	case "doctor":
+		return cmdDoctor(rest)
 	case "reindex":
 		return cmdReindex()
 	case "sync":
@@ -630,6 +633,50 @@ func cmdSearch(args []string) error {
 			loc = "message"
 		}
 		fmt.Printf("\n%-44s %s\n  %s\n  %s\n", h.ID, loc, h.Title, strings.ReplaceAll(h.Snippet, "\n", " "))
+	}
+	return nil
+}
+
+// cmdDoctor answers "why did nothing happen?". Exit code 1 when something is broken, so it is
+// usable from a shell — a health check nobody can script is a health check nobody runs.
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	herdrBin := fs.String("herdr", os.Getenv("CONE_HERDR"), "path to the herdr binary")
+	quiet := fs.Bool("quiet", false, "only show problems")
+	fs.Parse(reorder(fs, args))
+
+	b, err := open()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("board: %s\n\n", b.Root)
+
+	findings := append(b.Doctor(*herdrBin), install.Doctor(b.Root)...)
+	worst := board.OK
+	area := ""
+	for _, f := range findings {
+		if f.Severity > worst {
+			worst = f.Severity
+		}
+		if *quiet && f.Severity == board.OK {
+			continue
+		}
+		if f.Area != area {
+			fmt.Printf("%s\n", f.Area)
+			area = f.Area
+		}
+		fmt.Printf("  %s %s\n", f.Severity.Mark(), f.Message)
+		if f.Fix != "" {
+			fmt.Printf("      → %s\n", f.Fix)
+		}
+	}
+	switch worst {
+	case board.OK:
+		fmt.Println("\nthe board is healthy")
+	case board.Warn:
+		fmt.Println("\nnothing broken, but see the warnings above")
+	default:
+		return errors.New("the board has problems — see above")
 	}
 	return nil
 }
