@@ -18,13 +18,14 @@
 // expensive check (asking Herdr for agent states) only runs once the free one says there is
 // something to do.
 //
-// A note on failure, learned the hard way: this ran for weeks and never fired once. launchd
-// hands a user agent PATH=/usr/bin:/bin:/usr/sbin:/sbin, `herdr` lives in /opt/homebrew/bin,
-// every exec failed with ENOENT — and all three places that could have said so logged only
-// under --verbose, which the installed unit did not pass. A heartbeat that fails silently is
-// indistinguishable from a heartbeat with nothing to do. So: anything that *stops* a poke
-// that would otherwise have happened is reported unconditionally, and repeated only when it
-// changes or every 15 minutes, so the log stays readable without going quiet.
+// A note on failure. The first installed version of this never fired: launchd hands a user
+// agent PATH=/usr/bin:/bin:/usr/sbin:/sbin, `herdr` lives in /opt/homebrew/bin, every exec
+// failed with ENOENT — and all three places that could have said so logged only under
+// --verbose, which the installed unit did not pass. `.watch.log` was zero bytes and the job
+// showed as loaded. A heartbeat that fails silently is indistinguishable from a heartbeat
+// with nothing to do. So: anything that *stops* a poke that would otherwise have happened is
+// reported unconditionally, and repeated only when it changes or every 15 minutes, so the log
+// stays readable without going quiet.
 package watch
 
 import (
