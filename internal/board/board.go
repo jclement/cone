@@ -56,6 +56,8 @@ type Task struct {
 	ClaimedBy string    `yaml:"claimed_by"`
 	ClaimedAt time.Time `yaml:"claimed_at"`
 	Worktree  string    `yaml:"worktree"`
+	Agent     string    `yaml:"agent"`
+	Branch    string    `yaml:"branch"`
 	Completed time.Time `yaml:"completed"`
 
 	Body  string `yaml:"-"`
@@ -72,14 +74,14 @@ func Open(root string) (*Board, error) {
 		if err != nil {
 			return nil, err
 		}
-		root = filepath.Join(home, "agent")
+		root = filepath.Join(home, "cone")
 	}
 	b := &Board{Root: root}
 	return b, b.ensure()
 }
 
 func (b *Board) ensure() error {
-	dirs := []string{"board", "claims"}
+	dirs := []string{"board"}
 	for _, s := range States {
 		dirs = append(dirs, filepath.Join("tasks", string(s)))
 	}
@@ -91,7 +93,26 @@ func (b *Board) ensure() error {
 	return nil
 }
 
-func (b *Board) dir(s State) string             { return filepath.Join(b.Root, "tasks", string(s)) }
+func (b *Board) dir(s State) string { return filepath.Join(b.Root, "tasks", string(s)) }
+
+// idRe is the ONLY thing standing between a task id and the rest of the filesystem.
+//
+// filepath.Join calls Clean, so an id of "../../Developer/be/AGENTS" escapes the board root.
+// Claim would then hardlink that file into doing/ and os.Remove the original — arbitrary .md
+// deletion anywhere the user can write, reachable from the CLI and from the MCP server.
+// Validate in path() itself so no caller can forget.
+var idRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// ErrBadID is returned for an id that is not a plain filename.
+var ErrBadID = errors.New("invalid task id")
+
+func validID(id string) error {
+	if !idRe.MatchString(id) || strings.Contains(id, "..") {
+		return fmt.Errorf("%w: %q (letters, digits, dot, dash, underscore only — no slashes)", ErrBadID, id)
+	}
+	return nil
+}
+
 func (b *Board) path(s State, id string) string { return filepath.Join(b.dir(s), id+".md") }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -112,7 +133,13 @@ func (b *Board) New(t Task) (*Task, error) {
 	if t.Title == "" {
 		return nil, errors.New("a task needs a title")
 	}
-	if t.ID == "" {
+	// A derived id may collide — the slug is date + 48 bounded characters, so "investigate
+	// the slow well-loading query in the reporting export" and "…in the reporting API" are
+	// the same id on the same day. Refusing outright loses the second request, and for a
+	// remote inbox it loses it on every retry forever. Disambiguate instead; an explicitly
+	// supplied id is still taken literally and still refuses to collide.
+	derived := t.ID == ""
+	if derived {
 		t.ID = Slug(t.Title)
 	}
 	if t.Kind == "" {
@@ -132,7 +159,26 @@ func (b *Board) New(t Task) (*Task, error) {
 	// and then Find returns whichever state it happens to look in first — the board
 	// silently disagrees with itself about what a task id means.
 	if existing, err := b.Find(t.ID); err == nil {
-		return nil, fmt.Errorf("task %s already exists in %s", t.ID, existing.State)
+		// Refuse when this looks like the same request twice: an id the caller chose (which
+		// is an assertion about identity, and what dedup depends on), or the very same title
+		// typed again. Disambiguate when it does not: the slug is the date plus 48 bounded
+		// characters, so two different requests can collide on truncation alone, and a task
+		// arriving from an inbox has already been deduplicated upstream by SourceRef — losing
+		// it here loses it on every retry, forever.
+		sameRequest := !derived || (existing.Title == t.Title && t.SourceRef == "")
+		if sameRequest {
+			return nil, fmt.Errorf("task %s already exists in %s", t.ID, existing.State)
+		}
+		base := t.ID
+		for n := 2; ; n++ {
+			if n > 99 {
+				return nil, fmt.Errorf("task %s already exists in %s (and 98 variants of it)", base, existing.State)
+			}
+			t.ID = fmt.Sprintf("%s-%d", base, n)
+			if _, err := b.Find(t.ID); err != nil {
+				break
+			}
+		}
 	}
 	t.State, t.Path = Inbox, b.path(Inbox, t.ID)
 
@@ -147,11 +193,15 @@ func (b *Board) New(t Task) (*Task, error) {
 	if _, err := f.WriteString(t.Marshal()); err != nil {
 		return nil, err
 	}
+	b.touchIndex()
 	return &t, nil
 }
 
 // Find locates a task in whichever state holds it.
 func (b *Board) Find(id string) (*Task, error) {
+	if err := validID(id); err != nil {
+		return nil, err
+	}
 	for _, s := range States {
 		if t, err := b.load(s, id); err == nil {
 			return t, nil
@@ -202,11 +252,22 @@ func (b *Board) List(s State) ([]*Task, error) {
 	return out, nil
 }
 
-// move is the single state transition. os.Rename is atomic within a filesystem, and it is
-// the only mechanism this package uses to change state — see the package comment.
+// move is the single state transition.
+//
+// It uses link+remove rather than os.Rename for the same reason Claim does: rename is atomic
+// but NOT exclusive — it silently destroys whatever is already at the destination. If the same
+// id somehow exists in two states, a rename turns a transition into permanent deletion of a
+// task and its body, while printing success. Link fails EEXIST instead, which is the outcome
+// we want: loud.
 func (b *Board) move(t *Task, to State) error {
 	dst := b.path(to, t.ID)
-	if err := os.Rename(t.Path, dst); err != nil {
+	if err := os.Link(t.Path, dst); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("%s already exists in %s — refusing to overwrite it (run: cone doctor)", t.ID, to)
+		}
+		return err
+	}
+	if err := os.Remove(t.Path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	t.State, t.Path = to, dst
@@ -219,6 +280,9 @@ func (b *Board) move(t *Task, to State) error {
 // The race is resolved by the rename itself, not by checking first: a check-then-move would
 // leave a window in which both callers see the file and both proceed.
 func (b *Board) Claim(id, who string) (*Task, error) {
+	if err := validID(id); err != nil {
+		return nil, err
+	}
 	if who == "" {
 		who = "unknown"
 	}
@@ -226,8 +290,24 @@ func (b *Board) Claim(id, who string) (*Task, error) {
 	dst := b.path(Doing, id)
 
 	if err := os.Link(src, dst); err != nil {
-		if os.IsExist(err) || os.IsNotExist(err) {
+		switch {
+		case os.IsExist(err):
 			return nil, fmt.Errorf("%w: %s", ErrLostRace, id)
+		case os.IsNotExist(err):
+			// ready/ no longer holds it. Where it went decides what this means:
+			//   doing/  → someone won the race between our stat and our link. A real race.
+			//   else    → NOT a race: a typo, or a task still in inbox/, or already done.
+			// The distinction matters because agents are told to accept a lost race and move
+			// on, so conflating the two turns a typo into an unfixable dead end.
+			existing, ferr := b.Find(id)
+			switch {
+			case ferr != nil:
+				return nil, fmt.Errorf("no such task: %s", id)
+			case existing.State == Doing:
+				return nil, fmt.Errorf("%w: %s", ErrLostRace, id)
+			default:
+				return nil, fmt.Errorf("%s is in %s, not ready/ — only a triaged task is claimable", id, existing.State)
+			}
 		}
 		return nil, err
 	}
@@ -243,7 +323,16 @@ func (b *Board) Claim(id, who string) (*Task, error) {
 		return nil, err
 	}
 	t.ClaimedBy, t.ClaimedAt = who, time.Now().UTC()
-	return t, b.Save(t)
+	if err := b.Save(t); err != nil {
+		// Roll back rather than leave an unstamped task in doing/: Stale skips entries with
+		// no claimed_at, so it would occupy a worker slot forever and be reported by nothing.
+		if rbErr := b.move(t, Ready); rbErr != nil {
+			return nil, fmt.Errorf("claimed %s but could not stamp it (%v) AND could not roll back (%v) — fix by hand", id, err, rbErr)
+		}
+		return nil, fmt.Errorf("could not stamp the claim, released it again: %w", err)
+	}
+	b.touchIndex()
+	return t, nil
 }
 
 // Release returns a claimed or blocked task to ready and clears the claim.
@@ -259,7 +348,9 @@ func (b *Board) Release(id string) (*Task, error) {
 	if err := b.Save(t); err != nil {
 		return nil, err
 	}
-	return t, b.move(t, Ready)
+	err = b.move(t, Ready)
+	b.touchIndex()
+	return t, err
 }
 
 func (b *Board) Complete(id string) (*Task, error) {
@@ -274,7 +365,9 @@ func (b *Board) Complete(id string) (*Task, error) {
 	if err := b.Save(t); err != nil {
 		return nil, err
 	}
-	return t, b.move(t, Done)
+	err = b.move(t, Done)
+	b.touchIndex()
+	return t, err
 }
 
 func (b *Board) Block(id, why string) (*Task, error) {
@@ -292,7 +385,9 @@ func (b *Board) Block(id, why string) (*Task, error) {
 	if err := b.Save(t); err != nil {
 		return nil, err
 	}
-	return t, b.move(t, Blocked)
+	err = b.move(t, Blocked)
+	b.touchIndex()
+	return t, err
 }
 
 // Promote moves inbox -> ready. Triage is a deliberate step: an untriaged task should not
@@ -305,7 +400,9 @@ func (b *Board) Promote(id string) (*Task, error) {
 	if t.State != Inbox {
 		return nil, fmt.Errorf("only an inbox task can be promoted; %s is %s", id, t.State)
 	}
-	return t, b.move(t, Ready)
+	err = b.move(t, Ready)
+	b.touchIndex()
+	return t, err
 }
 
 // Save rewrites a task in place, preserving its state.
@@ -315,6 +412,17 @@ func (b *Board) Save(t *Task) error {
 		return err
 	}
 	return os.Rename(tmp, t.Path)
+}
+
+// touchIndex rebuilds the search index after a mutation.
+//
+// Search used to reindex only when the database file was ABSENT, which meant nothing written
+// after the first run was findable — the anti-duplication feature the board exists for
+// returned "no matches" for everything recent. A full rebuild is milliseconds at this scale
+// and cannot drift from the files, which is worth far more than incremental bookkeeping.
+// Indexing failure is never fatal: the files are the truth, the index is a cache.
+func (b *Board) touchIndex() {
+	_, _ = b.Reindex()
 }
 
 // Stale reports tasks claimed longer ago than d. It reports only: whether a claim is
@@ -327,7 +435,9 @@ func (b *Board) Stale(d time.Duration) ([]*Task, error) {
 	var out []*Task
 	cut := time.Now().UTC().Add(-d)
 	for _, t := range all {
-		if !t.ClaimedAt.IsZero() && t.ClaimedAt.Before(cut) {
+		// A doing/ task with no claim stamp is the worst case, not an exempt one: something
+		// put it there without claiming it, and nothing else will ever report it.
+		if t.ClaimedAt.IsZero() || t.ClaimedAt.Before(cut) {
 			out = append(out, t)
 		}
 	}

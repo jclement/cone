@@ -34,12 +34,41 @@ func (b *Board) Post(from, topic, body string) (*Message, error) {
 		from = "unknown"
 	}
 	m := &Message{From: from, Topic: topic, Posted: time.Now().UTC(), Body: body}
-	name := fmt.Sprintf("%s-%s.md", m.Posted.Format("20060102T150405Z"), slugRe.ReplaceAllString(strings.ToLower(topic), "-"))
-	m.Path = filepath.Join(b.boardDir(), strings.Trim(name, "-"))
-
 	content := fmt.Sprintf("%s\nfrom: %s\ntopic: %s\nposted: %s\n%s\n\n%s\n",
 		fence, m.From, m.Topic, fmtTime(m.Posted), fence, strings.TrimSpace(m.Body))
-	return m, os.WriteFile(m.Path, []byte(content), 0o644)
+
+	// The filename is second-resolution plus the topic slug, so two agents posting about the
+	// same thing in the same second collided — and os.WriteFile truncates, so one message
+	// simply vanished. O_EXCL turns that into a retry with a suffix instead of a silent loss.
+	stem := strings.Trim(fmt.Sprintf("%s-%s", m.Posted.Format("20060102T150405Z"),
+		slugRe.ReplaceAllString(strings.ToLower(topic), "-")), "-")
+	for n := 0; ; n++ {
+		name := stem + ".md"
+		if n > 0 {
+			name = fmt.Sprintf("%s-%d.md", stem, n+1)
+		}
+		if n > 99 {
+			return nil, fmt.Errorf("cannot find a free filename for a message about %q", topic)
+		}
+		m.Path = filepath.Join(b.boardDir(), name)
+		f, err := os.OpenFile(m.Path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		_, err = f.WriteString(content)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
+	}
+	b.touchIndex()
+	return m, nil
 }
 
 // Read returns the n most recent messages, newest first.

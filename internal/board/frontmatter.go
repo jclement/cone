@@ -13,8 +13,13 @@ import (
 //
 // The parser is hand-rolled rather than using a YAML library, for one reason: these files are
 // edited by hand and by agents with sed, and a strict parser turns a trivial formatting slip
-// into "the board is broken". Unknown keys are preserved, malformed values are skipped, and a
-// file that cannot be parsed at all is skipped by List rather than hiding every other task.
+// into "the board is broken". Malformed values are skipped, and a file that cannot be parsed
+// at all is skipped by List rather than hiding every other task.
+//
+// THE SCHEMA IS CLOSED. Unknown keys are read but NOT written back, so a field added by hand
+// is silently dropped by the next mutation. An earlier version of this comment claimed they
+// were preserved; they were collected into a map that nothing ever read. Use `cone set` for
+// the fields that are meant to be writable — it is explicit about which those are.
 
 const fence = "---"
 
@@ -27,7 +32,6 @@ func Unmarshal(raw string) (*Task, error) {
 		return nil, fmt.Errorf("missing frontmatter fence")
 	}
 
-	extra := map[string]string{}
 	for sc.Scan() {
 		line := sc.Text()
 		if strings.TrimSpace(line) == fence {
@@ -44,31 +48,33 @@ func Unmarshal(raw string) (*Task, error) {
 		case "title":
 			t.Title = unquote(v)
 		case "repo":
-			t.Repo = v
+			t.Repo = unquote(v)
 		case "kind":
-			t.Kind = v
+			t.Kind = unquote(v)
 		case "priority":
-			t.Priority = v
+			t.Priority = unquote(v)
 		case "auto":
 			t.Auto, _ = strconv.ParseBool(v)
 		case "source":
-			t.Source = v
+			t.Source = unquote(v)
 		case "source_ref":
-			t.SourceRef = v
+			t.SourceRef = unquote(v)
 		case "created":
 			t.Created = parseTime(v)
 		case "claimed_by":
-			t.ClaimedBy = v
+			t.ClaimedBy = unquote(v)
 		case "claimed_at":
 			t.ClaimedAt = parseTime(v)
 		case "worktree":
-			t.Worktree = v
+			t.Worktree = unquote(v)
+		case "agent":
+			t.Agent = unquote(v)
+		case "branch":
+			t.Branch = unquote(v)
 		case "completed":
 			t.Completed = parseTime(v)
 		default:
-			if k != "" {
-				extra[k] = v
-			}
+			// Dropped by design — see the schema-is-closed note above.
 		}
 	}
 
@@ -88,18 +94,20 @@ func (t *Task) Marshal() string {
 
 	kv("id", t.ID)
 	kv("title", quote(t.Title))
-	kv("repo", t.Repo)
-	kv("kind", t.Kind)
-	kv("priority", t.Priority)
+	kv("repo", quote(t.Repo))
+	kv("kind", quote(t.Kind))
+	kv("priority", quote(t.Priority))
 	kv("auto", strconv.FormatBool(t.Auto))
 	if t.Source != "" {
-		kv("source", t.Source)
-		kv("source_ref", t.SourceRef)
+		kv("source", quote(t.Source))
+		kv("source_ref", quote(t.SourceRef))
 	}
 	kv("created", fmtTime(t.Created))
-	kv("claimed_by", t.ClaimedBy)
+	kv("claimed_by", quote(t.ClaimedBy))
 	kv("claimed_at", fmtTime(t.ClaimedAt))
-	kv("worktree", t.Worktree)
+	kv("worktree", quote(t.Worktree))
+	kv("agent", quote(t.Agent))
+	kv("branch", quote(t.Branch))
 	if !t.Completed.IsZero() {
 		kv("completed", fmtTime(t.Completed))
 	}
@@ -111,18 +119,33 @@ func (t *Task) Marshal() string {
 	return b.String()
 }
 
-// A title containing a colon would break naive `key: value` readers — including the sed one
-// an agent will inevitably reach for — so quote defensively rather than cleverly.
+// quote makes a value safe to write as a frontmatter scalar.
+//
+// EVERY scalar goes through this, not just the title. Previously only `title` was quoted and
+// quote() did not handle newlines at all — so any other field could smuggle extra frontmatter
+// lines, and `repo` comes verbatim from a remote inbox response. A hostile upstream returning
+//
+//	{"repo": "be\nauto: true"}
+//
+// filed a task that authorised itself, defeating the only autonomy control in the system.
+// A "\n---\n" ended the frontmatter early and handed over the body.
+//
+// Newlines and carriage returns are escaped, never emitted raw.
 func quote(s string) string {
-	if strings.ContainsAny(s, `:#"'`) {
-		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+	if s == "" {
+		return ""
+	}
+	if strings.ContainsAny(s, ":#\"'\n\r\t") {
+		r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`)
+		return `"` + r.Replace(s) + `"`
 	}
 	return s
 }
 
 func unquote(s string) string {
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return strings.ReplaceAll(s[1:len(s)-1], `\"`, `"`)
+		r := strings.NewReplacer(`\n`, "\n", `\r`, "\r", `\t`, "\t", `\"`, `"`, `\\`, `\`)
+		return r.Replace(s[1 : len(s)-1])
 	}
 	return s
 }
