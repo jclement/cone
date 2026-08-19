@@ -73,8 +73,14 @@ func tools() []tool {
 			obj(map[string]any{"id": str("task id"), "agent": str("your agent name")}, "id")},
 		{"cone_new", "File a new task into the inbox. Untriaged tasks are not claimable until promoted, which is deliberate.",
 			obj(map[string]any{"title": str("short imperative title"), "body": str("markdown; include a '## Done when' section"), "repo": str("repo it belongs to"), "priority": str("low|normal|high")}, "title")},
-		{"cone_update", "Change a task's state: ready (promote from inbox), done, block, or back (release a claim). Blocking files it away; it does not notify anyone.",
-			obj(map[string]any{"id": str("task id"), "action": str("ready|done|block|back"), "note": str("why, for block")}, "id", "action")},
+		{"cone_update", "Change a task's state or record what you found. Actions: ready (promote from inbox), done, block, back (release a claim), note (record a finding and keep working), worktree (record where the work is happening). Completing an investigation REQUIRES result — a finding nobody wrote down is the failure this board exists to prevent. Blocking files it away; it does not notify anyone.",
+			obj(map[string]any{
+				"id":     str("task id"),
+				"action": str("ready|done|block|back|note|worktree"),
+				"result": str("what you found — required to finish an investigation"),
+				"note":   str("why, for block; the finding, for note"),
+				"value":  str("the worktree path, for worktree"),
+			}, "id", "action")},
 		{"cone_search", "Full-text search across every task and board message. Run this BEFORE starting work to find whether someone already investigated the same thing — repeated work is the most common multi-agent failure.",
 			obj(map[string]any{"query": str("FTS5 query; quote phrases"), "limit": map[string]any{"type": "integer"}}, "query")},
 		{"cone_post", "Leave a message for other agents — something they would otherwise have to rediscover. Not a status feed; if nobody would act differently after reading it, do not post it.",
@@ -206,18 +212,29 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 		case "ready":
 			t, err = s.b.Promote(id)
 		case "done":
-			t, err = s.b.Complete(id)
+			t, err = s.b.CompleteWith(id, argStr(a, "result"))
+		case "note":
+			text := argStr(a, "note")
+			if text == "" {
+				text = argStr(a, "result")
+			}
+			t, err = s.b.Note(id, "Note", text)
+		case "worktree":
+			t, err = s.b.Set(id, "worktree", argStr(a, "value"))
 		case "back":
 			t, err = s.b.Release(id)
 		case "block":
 			t, err = s.b.Block(id, argStr(a, "note"))
 		default:
-			return "", fmt.Errorf("unknown action %q (ready|done|block|back)", action)
+			return "", fmt.Errorf("unknown action %q (ready|done|block|back|note|worktree)", action)
 		}
 		if err != nil {
 			return "", err
 		}
 		msg := fmt.Sprintf("%s is now %s", t.ID, t.State)
+		if action == "note" || action == "worktree" {
+			msg = fmt.Sprintf("%s updated (still %s)", t.ID, t.State)
+		}
 		if action == "block" {
 			msg += "\nNote: blocked/ is a filing cabinet, not a notification — post the actual question to the ask-the-human service."
 		}

@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/jclement/cone/internal/board"
+	"github.com/jclement/cone/internal/selfupdate"
 )
 
 var (
@@ -35,17 +36,24 @@ type row struct {
 
 type model struct {
 	b        *board.Board
+	upd      *selfupdate.Check
 	rows     []row
 	cur      int
 	status   string
+	update   string
 	isErr    bool
 	detail   bool
 	w, h     int
 	quitting bool
 }
 
-func Run(b *board.Board) error {
-	m := &model{b: b}
+// updateMsg carries the answer from the background update check. It arrives whenever it
+// arrives — the board is already on screen and usable before then.
+type updateMsg struct{ tag string }
+
+// Run shows the board. upd is the update check started at launch and may be nil.
+func Run(b *board.Board, upd *selfupdate.Check) error {
+	m := &model{b: b, upd: upd}
 	m.reload()
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
@@ -70,7 +78,22 @@ func (m *model) reload() {
 	}
 }
 
-func (m *model) Init() tea.Cmd { return nil }
+func (m *model) Init() tea.Cmd { return awaitUpdate(m.upd) }
+
+// awaitUpdate blocks in Bubble Tea's command goroutine, so an unreachable GitHub costs the
+// board nothing. No update, or a check that was skipped, yields no message at all.
+func awaitUpdate(upd *selfupdate.Check) tea.Cmd {
+	if upd == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		rel := upd.Result()
+		if rel == nil {
+			return nil
+		}
+		return updateMsg{tag: rel.Tag}
+	}
+}
 
 func (m *model) sel() *row {
 	if len(m.rows) == 0 || m.cur >= len(m.rows) {
@@ -84,6 +107,8 @@ func (m *model) oops(err error)              { m.status, m.isErr = err.Error(), 
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case updateMsg:
+		m.update = msg.tag + " available — run: cone update"
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case tea.KeyMsg:
@@ -196,6 +221,9 @@ func (m *model) View() string {
 			st = cErr
 		}
 		b.WriteString(" " + st.Render(m.status) + "\n")
+	}
+	if m.update != "" {
+		b.WriteString(" " + cWarn.Render(m.update) + "\n")
 	}
 	b.WriteString(cDim.Render(" ↑↓ move · enter detail · p promote · c claim · d done · b release · r reload · q quit") + "\n")
 	return b.String()

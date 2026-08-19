@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/jclement/cone/internal/inbox"
 	"github.com/jclement/cone/internal/install"
 	"github.com/jclement/cone/internal/mcpsrv"
+	"github.com/jclement/cone/internal/selfupdate"
 	"github.com/jclement/cone/internal/tui"
 	"github.com/jclement/cone/internal/watch"
 )
@@ -42,10 +44,13 @@ TASKS
   cone show <id>              print a task
   cone ready <id>             inbox -> ready (triaged, claimable)
   cone claim <id> [-as name]  ready -> doing. ATOMIC: exactly one agent wins
-  cone done <id>              doing -> done
+  cone done <id> [--result …] doing -> done. An investigation needs a result
   cone block <id> [why]       doing -> blocked
   cone back <id>              release a claim, back to ready
+  cone note <id> <text>       record a finding without changing state
+  cone set <id> <key> <val>   worktree | agent | branch | repo | priority
   cone stale [-h hours]       claims older than N hours (reports only)
+  cone reap [--dry-run]       release claims held by agents herdr has lost
 
 MESSAGES
   cone post <topic> <text>    leave something for other agents
@@ -62,6 +67,7 @@ RUN
   cone mcp                    stdio MCP server (for claude mcp add)
   cone serve [-addr :7788]    HTTP MCP server (for remote agents)
   cone install                install skills + the platform scheduler
+  cone update [--check]       verified in-place upgrade to the latest release
   cone version
 
   Board root: $CONE_HOME, else ~/cone
@@ -102,8 +108,7 @@ func run(args []string) error {
 		fmt.Print(usage)
 		return nil
 	case "version", "--version":
-		fmt.Printf("cone %s (%s, built %s)\n", version, commit, buildDate)
-		return nil
+		return cmdVersion()
 	case "new":
 		return cmdNew(rest)
 	case "ls", "list":
@@ -120,6 +125,12 @@ func run(args []string) error {
 		return cmdBlock(rest)
 	case "back", "release":
 		return cmdTransition(rest, "back")
+	case "note":
+		return cmdNote(rest)
+	case "set":
+		return cmdSet(rest)
+	case "reap":
+		return cmdReap(rest)
 	case "stale":
 		return cmdStale(rest)
 	case "post":
@@ -140,6 +151,8 @@ func run(args []string) error {
 		return cmdServe(rest)
 	case "install":
 		return install.Run(rest)
+	case "update":
+		return selfupdate.Run(rest, version)
 	case "tui":
 		return runTUI()
 	default:
@@ -147,12 +160,80 @@ func run(args []string) error {
 	}
 }
 
+// reorder pulls flags out of a free-text argument list so they can be written anywhere.
+//
+// Go's flag package stops parsing at the first positional. That is right for git-shaped
+// commands and wrong for every command here that takes a sentence: `cone new "why is the
+// solver slow" -kind investigate` filed a task actually titled "why is the solver slow -kind
+// investigate", with the kind silently ignored — the same trap that made `cone search foo -n 2`
+// an FTS5 syntax error. The FlagSet is consulted for what is a flag and whether it takes a
+// value, so a word that merely starts with a dash is never eaten.
+func reorder(fs *flag.FlagSet, args []string) []string {
+	known, isBool := map[string]bool{}, map[string]bool{}
+	fs.VisitAll(func(f *flag.Flag) {
+		known[f.Name] = true
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			isBool[f.Name] = true
+		}
+	})
+
+	var flags, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" { // the explicit end of flags; everything after is text
+			rest = append(rest, args[i+1:]...)
+			break
+		}
+
+		if !strings.HasPrefix(a, "-") || len(a) < 2 {
+			rest = append(rest, a)
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if k, _, ok := strings.Cut(name, "="); ok {
+			if known[k] {
+				flags = append(flags, a)
+			} else {
+				rest = append(rest, a)
+			}
+			continue
+		}
+		if !known[name] {
+			rest = append(rest, a)
+			continue
+		}
+		flags = append(flags, a)
+		if !isBool[name] && i+1 < len(args) {
+			flags = append(flags, args[i+1])
+			i++
+		}
+	}
+	// The separator is always emitted: with the flags hoisted to the front, a positional that
+	// itself begins with a dash ("-1 was the culprit") would otherwise be re-parsed as one.
+	return append(append(flags, "--"), rest...)
+}
+
 func runTUI() error {
+	upd := selfupdate.Start(version)
 	b, err := open()
 	if err != nil {
 		return err
 	}
-	return tui.Run(b)
+	return tui.Run(b, upd)
+}
+
+// updateNotice is how long `cone version` will wait on the background check. GitHub answers
+// in a fraction of this from a warm network; anything slower is dropped, because a version
+// command that sits there is worse than one that says nothing about updates.
+const updateNotice = 2 * time.Second
+
+func cmdVersion() error {
+	upd := selfupdate.Start(version)
+	fmt.Printf("cone %s (%s, built %s)\n", version, commit, buildDate)
+	if rel := upd.Wait(updateNotice); rel != nil {
+		fmt.Printf("%s available — run: cone update\n", rel.Tag)
+	}
+	return nil
 }
 
 func cmdNew(args []string) error {
@@ -162,7 +243,7 @@ func cmdNew(args []string) error {
 	prio := fs.String("priority", "normal", "low|normal|high")
 	auto := fs.Bool("auto", false, "pre-authorise starting without asking")
 	ready := fs.Bool("ready", false, "skip triage and file straight into ready")
-	fs.Parse(args)
+	fs.Parse(reorder(fs, args))
 	if fs.NArg() == 0 {
 		return errors.New("usage: cone new [flags] <title>")
 	}
@@ -245,7 +326,7 @@ func cmdShow(args []string) error {
 func cmdClaim(args []string) error {
 	fs := flag.NewFlagSet("claim", flag.ExitOnError)
 	as := fs.String("as", "", "claim as this agent name")
-	fs.Parse(args)
+	fs.Parse(reorder(fs, args))
 	if fs.NArg() == 0 {
 		return errors.New("usage: cone claim [-as name] <id>")
 	}
@@ -267,9 +348,29 @@ func cmdClaim(args []string) error {
 }
 
 func cmdTransition(args []string, to string) error {
-	if len(args) == 0 {
+	fs := flag.NewFlagSet(to, flag.ExitOnError)
+	result := fs.String("result", "", "what you found (done; required for an investigation)")
+	resultFile := fs.String("result-file", "", "read the result from a file, or - for stdin")
+	fs.Parse(reorder(fs, args))
+	if fs.NArg() == 0 {
 		return fmt.Errorf("usage: cone %s <id>", to)
 	}
+	id := fs.Arg(0)
+
+	if *resultFile != "" {
+		var data []byte
+		var err error
+		if *resultFile == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(*resultFile)
+		}
+		if err != nil {
+			return err
+		}
+		*result = string(data)
+	}
+
 	b, err := open()
 	if err != nil {
 		return err
@@ -277,16 +378,93 @@ func cmdTransition(args []string, to string) error {
 	var t *board.Task
 	switch to {
 	case "ready":
-		t, err = b.Promote(args[0])
+		t, err = b.Promote(id)
 	case "done":
-		t, err = b.Complete(args[0])
+		t, err = b.CompleteWith(id, *result)
 	case "back":
-		t, err = b.Release(args[0])
+		t, err = b.Release(id)
 	}
 	if err != nil {
 		return err
 	}
 	fmt.Println(t.Path)
+	return nil
+}
+
+// cmdNote appends a finding to a task without changing its state. A worker that learns
+// something at hour one should not have to survive to hour six for it to be findable.
+func cmdNote(args []string) error {
+	fs := flag.NewFlagSet("note", flag.ExitOnError)
+	heading := fs.String("heading", "Note", "section heading")
+	fs.Parse(reorder(fs, args))
+	if fs.NArg() < 1 {
+		return errors.New("usage: cone note <id> <text>   (or: … <id> - to read stdin)")
+	}
+	text := strings.Join(fs.Args()[1:], " ")
+	if text == "-" || text == "" {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		text = string(data)
+	}
+	b, err := open()
+	if err != nil {
+		return err
+	}
+	t, err := b.Note(fs.Arg(0), *heading, text)
+	if err != nil {
+		return err
+	}
+	fmt.Println(t.Path)
+	return nil
+}
+
+// cmdSet closes the task -> worker -> worktree triangle, so any vertex finds the others and an
+// abandoned checkout is distinguishable from debris.
+func cmdSet(args []string) error {
+	if len(args) < 3 {
+		return errors.New("usage: cone set <id> <worktree|agent|branch|repo|priority> <value>")
+	}
+	b, err := open()
+	if err != nil {
+		return err
+	}
+	t, err := b.Set(args[0], args[1], strings.Join(args[2:], " "))
+	if err != nil {
+		return err
+	}
+	fmt.Println(t.Path)
+	return nil
+}
+
+// cmdReap releases claims held by agents herdr no longer knows about. The worker cap counts
+// tasks in doing/, so dead claims do not merely clutter — four of them stop the heartbeat.
+func cmdReap(args []string) error {
+	fs := flag.NewFlagSet("reap", flag.ExitOnError)
+	dry := fs.Bool("dry-run", false, "say what would be released; change nothing")
+	herdrBin := fs.String("herdr", os.Getenv("CONE_HERDR"), "path to the herdr binary")
+	fs.Parse(reorder(fs, args))
+	b, err := open()
+	if err != nil {
+		return err
+	}
+	reaped, err := b.Reap(*herdrBin, *dry)
+	if err != nil {
+		return fmt.Errorf("%w — refusing to release anything while herdr cannot be asked "+
+			"who is alive", err)
+	}
+	if len(reaped) == 0 {
+		fmt.Println("no claims held by dead agents")
+		return nil
+	}
+	for _, t := range reaped {
+		verb := "released"
+		if *dry {
+			verb = "would release"
+		}
+		fmt.Printf("%s %s (claimed by %s)\n", verb, t.ID, t.ClaimedBy)
+	}
 	return nil
 }
 
@@ -311,7 +489,7 @@ func cmdBlock(args []string) error {
 func cmdStale(args []string) error {
 	fs := flag.NewFlagSet("stale", flag.ExitOnError)
 	hours := fs.Int("h", 8, "claims older than this many hours")
-	fs.Parse(args)
+	fs.Parse(reorder(fs, args))
 	b, err := open()
 	if err != nil {
 		return err
@@ -351,7 +529,7 @@ func cmdPost(args []string) error {
 func cmdRead(args []string) error {
 	fs := flag.NewFlagSet("read", flag.ExitOnError)
 	n := fs.Int("n", 10, "how many messages")
-	fs.Parse(args)
+	fs.Parse(reorder(fs, args))
 	b, err := open()
 	if err != nil {
 		return err
@@ -477,7 +655,11 @@ func cmdWatch(args []string) error {
 	verbose := fs.Bool("verbose", false, "log every decision")
 	dry := fs.Bool("dry-run", false, "say what it would do; poke nothing")
 	once := fs.Bool("once", false, "run one cycle and exit")
-	fs.Parse(args)
+	// The installed unit passes an absolute path: launchd's PATH does not include Homebrew,
+	// so a bare "herdr" resolves to nothing and the heartbeat fails silently forever.
+	herdrBin := fs.String("herdr", os.Getenv("CONE_HERDR"), "path to the herdr binary")
+	noReap := fs.Bool("no-reap", false, "leave claims held by agents herdr no longer knows about")
+	fs.Parse(reorder(fs, args))
 
 	b, err := open()
 	if err != nil {
@@ -485,6 +667,7 @@ func cmdWatch(args []string) error {
 	}
 	w := watch.New(b, watch.Options{
 		Interval: *interval, MaxWorkers: *max, Verbose: *verbose, DryRun: *dry,
+		HerdrBin: *herdrBin, NoReap: *noReap,
 	})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -510,7 +693,7 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:7788", "listen address")
 	token := fs.String("token", os.Getenv("CONE_TOKEN"), "bearer token required from clients")
-	fs.Parse(args)
+	fs.Parse(reorder(fs, args))
 	b, err := open()
 	if err != nil {
 		return err

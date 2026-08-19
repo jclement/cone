@@ -1,0 +1,12 @@
+# "A release you can't rebuild safely six months later isn't shipped." — the shipping skill
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

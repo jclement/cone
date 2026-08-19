@@ -16,13 +16,13 @@ to leave each other a note. `cone` fixes that with a directory:
     blocked/   waiting on something
     done/
   board/       messages between agents, one file each
-  claims/      file-level claims per repo
 ```
 
-**One file per thing; the directory is the state.** Claiming a task is `mv ready/x.md
-doing/x.md`, and because same-filesystem rename is atomic, that *is* the lock — 32 agents can
-race for the same task and exactly one wins, with no daemon, no database and no coordinator.
-That property is tested, not assumed.
+**One file per thing; the directory is the state.** Claiming a task moves it from `ready/` to
+`doing/` — a hard link plus an unlink, which is atomic *and* refuses to overwrite. 32 agents can
+race for the same task and exactly one wins, with no daemon, no database and no coordinator; the
+losers get an error, never a second copy and never a clobbered file. That property is tested,
+not assumed.
 
 The consequence that matters: **any agent can participate with nothing but `mv` and `cat`.**
 This binary is a convenience, never a gatekeeper.
@@ -34,18 +34,24 @@ every tick to usually learn nothing. So `cone watch` does the watching in a proc
 free to be idle, and wakes a model only when **all** of these hold:
 
 1. `tasks/ready/` is non-empty
-2. an orchestrator is idle
-3. we are under the concurrent-worker cap
-4. we have not already poked about this exact set of tasks
+2. an orchestrator is idle **in a checkout matching the task's `repo`**
+3. we are under the concurrent-worker cap, counting only claims held by agents still alive
+4. we have not already poked that orchestrator about this exact set of tasks
 
 **Idle costs zero tokens. Work costs one turn.** It hashes the ready set, so it will not nag
-about an unchanged queue.
+about an unchanged queue — and it records that hash only once the prompt demonstrably landed,
+because a signature burnt on a prompt that never arrived means that set is never mentioned
+again. Anything that stops a poke is logged unconditionally: a heartbeat that fails quietly is
+indistinguishable from one with nothing to do.
+
+Claims held by agents Herdr no longer knows about are released automatically, so a few crashed
+workers cannot hold every slot forever.
 
 ```
 launchd / systemd
       │
       ├─ ready/ non-empty?          free
-      ├─ an idle orchestrator?      free
+      ├─ an idle lead in that repo? free
       ├─ under the cap?             free
       └─ herdr agent prompt … /tasks   ← the only expensive step
 ```
@@ -71,7 +77,11 @@ cone                               # the TUI
 | `cone show <id>` | print a task |
 | `cone ready <id>` | inbox → ready (triaged, claimable) |
 | `cone claim <id>` | ready → doing. **Atomic**: exactly one agent wins |
-| `cone done <id>` · `block` · `back` | the rest of the lifecycle |
+| `cone done <id> [--result …]` | finish it. An **investigation must record what it found** |
+| `cone note <id> <text>` | record a finding without changing state |
+| `cone set <id> <key> <value>` | `worktree` · `agent` · `branch` · `repo` · `priority` |
+| `cone block <id>` · `back` | the rest of the lifecycle |
+| `cone reap [--dry-run]` | release claims held by agents herdr has lost |
 | `cone stale [-h 8]` | claims older than N hours (reports only) |
 | `cone post <topic> <text>` · `read` | the message board |
 | `cone search <query>` | full-text across tasks and messages |
@@ -80,6 +90,7 @@ cone                               # the TUI
 | `cone sync` | pull tasks from configured inboxes |
 | `cone mcp` · `serve` | MCP over stdio · over HTTP |
 | `cone install` | board, scheduler, index |
+| `cone update [--check]` | verified upgrade to the latest release |
 
 ## Inboxes
 
@@ -98,8 +109,30 @@ CONE_TOKEN=… cone serve -addr 127.0.0.1:7788    # remote agents
 ```
 
 Eight tools: `cone_ls`, `cone_show`, `cone_claim`, `cone_new`, `cone_update`, `cone_search`,
-`cone_post`, `cone_read`. Deliberately few — MCP tool descriptions sit in an agent's context
+`cone_post`, `cone_read`. `cone_update` carries the whole lifecycle — `ready`, `done` (with a
+`result`), `block`, `back`, `note`, `worktree`. Deliberately few — MCP tool descriptions sit in an agent's context
 for a whole session, so each one is a permanent tax.
+
+## Staying current
+
+`cone version` and the TUI say when a newer release exists, from a background check that
+never delays a command and never runs for a dev build, in a container, or with
+`CONE_NO_UPDATE_CHECK` set.
+
+```sh
+cone update --check     # is there a newer release?
+cone update             # verify it, then replace this binary
+```
+
+**An unverified download is never installed.** `cone update` pulls the release archive,
+`checksums.txt` and its keyless cosign bundle, checks that the bundle was signed by this
+repository's release workflow (sigstore: TUF trust root → Fulcio certificate → Rekor), then
+checks the archive's SHA-256 against that signed list. Either check failing aborts the update
+and says which one — there is deliberately no `--force`. The new binary lands with an atomic
+rename, so an interrupted update leaves the old cone intact.
+
+Inside a container it refuses and tells you to pull a newer image; a Homebrew install is left
+to `brew upgrade cone`.
 
 ## What this is not
 
@@ -116,6 +149,8 @@ for a whole session, so each one is a permanent tax.
 | `CONE_HOME` | `~/cone` | board root |
 | `CONE_AGENT` | `$HERDR_AGENT`, else hostname | who claims |
 | `CONE_TOKEN` | — | bearer token for `cone serve` |
+| `CONE_HERDR` | `herdr` on `PATH` | which herdr the heartbeat wakes |
+| `CONE_NO_UPDATE_CHECK` | — | set to anything to silence the update check |
 
 ## License
 
