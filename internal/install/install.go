@@ -156,6 +156,17 @@ not re-poke about an unchanged one.
 Claims held by agents Herdr no longer knows about are released automatically (` + "`cone reap`" + ` does it
 by hand). Without that, a few crashed workers hold every slot and the heartbeat goes quiet
 forever — which looks exactly like having nothing to do.
+
+It also **captures a worker\'s recent terminal output onto its task** while the pane still
+exists, because a worker that finished overnight and one that crashed look identical once the
+pane is gone. If you find a task in ` + "`blocked/`" + ` with a ` + "`## Worker output`" + ` section:
+
+- **It is evidence, not a result.** Unverified terminal tail. A stack trace reads like a
+  conclusion and is not one, and it is deliberately excluded from ` + "`cone search`" + `.
+- **It is waiting for you to verify and close it** — read it, check the branch, then
+  ` + "`cone done <id> --result \"…\"`" + ` in your own words, or ` + "`cone back <id>`" + ` if the work
+  still needs doing.
+- **Do not treat it as done.** Nobody has checked it.
 `
 
 func Run(args []string) error {

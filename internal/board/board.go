@@ -356,7 +356,9 @@ func (b *Board) Release(id string) (*Task, error) {
 	if t.State != Doing && t.State != Blocked {
 		return nil, fmt.Errorf("only doing or blocked tasks can be released; %s is %s", id, t.State)
 	}
-	t.ClaimedBy, t.ClaimedAt = "", time.Time{}
+	// Agent goes too. A released task has no worker, and a stale name would make the next
+	// reaper pass treat it as a dead claim the moment somebody picks it up.
+	t.ClaimedBy, t.ClaimedAt, t.Agent = "", time.Time{}, ""
 	if err := b.Save(t); err != nil {
 		return nil, err
 	}

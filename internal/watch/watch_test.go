@@ -298,3 +298,164 @@ esac
 		t.Fatal("gave up without recording the set, so it will nag again after a restart")
 	}
 }
+
+// harvestHerdr fakes a worker that has finished a turn and is sitting unread, with terminal
+// output to capture. Each `agent read` returns whatever is in $dir/output.
+func harvestHerdr(t *testing.T, worker string) (bin, dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	bin = filepath.Join(dir, "herdr")
+	script := `#!/bin/sh
+echo "$@" >> "` + dir + `/calls"
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\n' ;;
+  "agent list") printf '{"result":{"agents":[{"name":"` + worker + `","agent_status":"done","cwd":"/Users/x/.superset/worktrees/be/x"}]}}\n' ;;
+  "agent read") cat "` + dir + `/output" ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, "output"), []byte("$ mise run check\nEXIT=0\nthe N+1 was in loadWells\n"), 0o644)
+	return bin, dir
+}
+
+func claimedBy(t *testing.T, b *board.Board, worker string) *board.Task {
+	t.Helper()
+	task, err := b.New(board.Task{Title: "delegated work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Promote(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Claim(task.ID, "lead"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Set(task.ID, "agent", worker); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := b.Find(task.ID)
+	return got
+}
+
+// The 2am case: a worker finishes, nobody reads it, and by morning the pane is gone along with
+// the only account of what happened.
+func TestAFinishedWorkersOutputIsCapturedOntoItsTask(t *testing.T) {
+	bin, _ := harvestHerdr(t, "be-2175")
+	b, err := board.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	got, err := b.Find(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !board.HasWorkerOutput(got.Body) {
+		t.Fatalf("nothing was captured:\n%s", got.Body)
+	}
+	if !strings.Contains(got.Body, "the N+1 was in loadWells") {
+		t.Fatalf("the worker's output is not on the task:\n%s", got.Body)
+	}
+	if !strings.Contains(got.Body, "unverified") {
+		t.Error("terminal tail was stored without being marked unverified — it reads as a finding")
+	}
+}
+
+// herdr flips an agent to "done" at the end of EVERY turn, not once at the end of the work.
+// Appending would grow the file all night.
+func TestRepeatedHarvestsReplaceRatherThanAccumulate(t *testing.T) {
+	bin, dir := harvestHerdr(t, "be-2175")
+	b, _ := board.Open(t.TempDir())
+	task := claimedBy(t, b, "be-2175")
+
+	w := New(b, Options{HerdrBin: bin})
+	w.Tick(context.Background())
+	os.WriteFile(filepath.Join(dir, "output"), []byte("later: it was the cache after all\n"), 0o644)
+	w.Tick(context.Background())
+
+	got, _ := b.Find(task.ID)
+	if n := strings.Count(got.Body, "## Worker output"); n != 1 {
+		t.Fatalf("the task carries %d output sections, want 1:\n%s", n, got.Body)
+	}
+	if !strings.Contains(got.Body, "the cache after all") {
+		t.Error("the latest output did not replace the older snapshot")
+	}
+}
+
+// Terminal tail is evidence, not a finding. It must not compete for rank with what an agent
+// actually concluded — that is the one question the index exists to answer.
+func TestCapturedOutputIsNotSearchable(t *testing.T) {
+	bin, _ := harvestHerdr(t, "be-2175")
+	b, _ := board.Open(t.TempDir())
+	claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	hits, err := b.Search("loadWells", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("captured terminal output is in the search index (%d hits)", len(hits))
+	}
+	if hits, _ := b.Search("delegated", 10); len(hits) == 0 {
+		t.Fatal("stripping the snapshot also removed the task itself from the index")
+	}
+}
+
+// A finished worker and a crashed one look identical once the pane is gone. Releasing the
+// finished one to ready/ offers work that is already done to somebody else.
+func TestAHarvestedTaskIsHeldForReviewNotReoffered(t *testing.T) {
+	bin, dir := harvestHerdr(t, "be-2175")
+	b, _ := board.Open(t.TempDir())
+	task := claimedBy(t, b, "be-2175")
+
+	w := New(b, Options{HerdrBin: bin})
+	w.Tick(context.Background()) // captures
+	// The pane goes away: herdr no longer lists the worker at all.
+	os.WriteFile(filepath.Join(dir, "herdr"), []byte(`#!/bin/sh
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\n' ;;
+  "agent list") printf '{"result":{"agents":[]}}\n' ;;
+esac
+`), 0o755)
+	w.Tick(context.Background()) // reaps
+
+	got, err := b.Find(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State == board.Ready {
+		t.Fatal("finished work was put back on the queue as if nobody had done it")
+	}
+	if got.State != board.Blocked {
+		t.Fatalf("state is %s, want blocked — a human has to read the output and close it", got.State)
+	}
+}
+
+// A worker that crashed with nothing to show has no snapshot, and that task genuinely should
+// go back on the queue.
+func TestAClaimWithNothingToShowIsStillReleased(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	os.WriteFile(bin, []byte(`#!/bin/sh
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\n' ;;
+  "agent list") printf '{"result":{"agents":[]}}\n' ;;
+esac
+`), 0o755)
+	b, _ := board.Open(t.TempDir())
+	task := claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	got, _ := b.Find(task.ID)
+	if got.State != board.Ready {
+		t.Fatalf("state is %s, want ready — nothing was captured, so the work still needs doing", got.State)
+	}
+}

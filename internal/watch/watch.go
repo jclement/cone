@@ -157,21 +157,48 @@ func (w *Watcher) Tick(ctx context.Context) {
 		w.hold("cannot read %s: %v", w.b.Root, err)
 		return
 	}
-	if len(ready) == 0 {
+	doing, err := w.b.List(board.Doing)
+	if err != nil {
+		w.hold("cannot read %s: %v", w.b.Root, err)
+		return
+	}
+	// Two directory reads, and on an empty board that is the whole tick: no subprocesses, no
+	// tokens, nothing. Work in flight counts as well as work waiting — this used to return
+	// here whenever ready/ was empty, which is the *normal* state at 2am while a worker is
+	// finishing, so the one moment harvesting exists for was the one it never ran in.
+	if len(ready) == 0 && len(doing) == 0 {
 		w.clear()
-		return // the free check said no. Nothing else runs.
+		return
 	}
 
-	// A claim held by an agent Herdr no longer knows about is not work in progress, it is a
-	// slot lost forever: the cap counts files in doing/, so four dead claims wedge the
-	// heartbeat permanently with no trace.
-	if !w.opt.NoReap && !w.opt.DryRun {
-		if reaped, err := w.b.Reap(w.opt.HerdrBin, false); err == nil && len(reaped) > 0 {
-			for _, t := range reaped {
-				w.say("released %s: claimant %q is gone", t.ID, t.ClaimedBy)
+	agents, aerr := w.inventory(ctx)
+	if aerr != nil {
+		w.hold("cannot ask herdr (%s) who is running: %v", w.opt.HerdrBin, aerr)
+		return
+	}
+
+	if len(doing) > 0 && !w.opt.DryRun {
+		// Capture before reaping. A worker that finished and one that crashed look identical
+		// once the pane is gone; the snapshot is what tells them apart, and taking it has to
+		// happen while the pane still exists.
+		w.harvest(ctx, agents)
+
+		// A claim held by an agent Herdr no longer knows about is not work in progress, it
+		// is a slot lost forever: the cap counts files in doing/, so a few dead claims wedge
+		// the heartbeat permanently with no trace.
+		if !w.opt.NoReap {
+			if reaped, err := w.b.Reap(w.opt.HerdrBin, false); err == nil && len(reaped) > 0 {
+				for _, t := range reaped {
+					w.say("worker %q for %s is gone; it is now %s", t.Agent, t.ID, t.State)
+				}
+				ready, _ = w.b.List(board.Ready)
 			}
-			ready, _ = w.b.List(board.Ready)
 		}
+	}
+
+	if len(ready) == 0 {
+		w.clear()
+		return // nothing waiting; the in-flight housekeeping above was the point of this tick
 	}
 
 	inFlight := w.b.ActiveClaims(w.opt.HerdrBin)
@@ -180,11 +207,7 @@ func (w *Watcher) Tick(ctx context.Context) {
 		return
 	}
 
-	cands, err := w.idleOrchestrators(ctx)
-	if err != nil {
-		w.hold("cannot ask herdr (%s) who is idle: %v", w.opt.HerdrBin, err)
-		return
-	}
+	cands := idleOrchestrators(agents)
 	if len(cands) == 0 {
 		w.hold("%d task(s) ready, no idle orchestrator to take them", len(ready))
 		return
@@ -284,23 +307,23 @@ func signature(tasks []*board.Task) string {
 
 type candidate struct{ session, name, cwd string }
 
-// idleOrchestrators finds agents sitting in a MAIN checkout. Workers live under a worktrees
-// directory; anything else running an agent is a lead. Sessions are enumerated because a
-// machine may still have more than one.
+// agent is one row of `herdr agent list`, in whichever session it was found.
+type agent struct {
+	session, name, status, cwd string
+}
+
+// inventory asks every running session who it has. It is the one expensive call in a tick, so
+// harvesting and the idle-lead search share it.
 //
-// Only "idle" counts. "done" was accepted here once and should not be: an agent that has
-// finished and exited still lists, and prompting it is a message into a dead pane.
-func (w *Watcher) idleOrchestrators(ctx context.Context) ([]candidate, error) {
-	var out []candidate
-	var asked bool
-	var lastErr error
+// A session that cannot be listed fails the whole inventory rather than being skipped: agents
+// in it would read as absent, and "absent" is what makes a claim look abandoned.
+func (w *Watcher) inventory(ctx context.Context) ([]agent, error) {
+	var out []agent
 	for _, s := range w.sessions(ctx) {
 		raw, err := w.herdr(ctx, s, "agent", "list")
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, fmt.Errorf("session %q: %w", s, err)
 		}
-		asked = true
 		var env struct {
 			Result struct {
 				Agents []struct {
@@ -315,23 +338,75 @@ func (w *Watcher) idleOrchestrators(ctx context.Context) ([]candidate, error) {
 			continue
 		}
 		for _, a := range env.Result.Agents {
-			if strings.Contains(a.CWD, "/worktrees/") || a.Status != "idle" {
-				continue
-			}
 			n := a.Name
 			if n == "" {
 				n = a.PaneID
 			}
-			out = append(out, candidate{session: s, name: n, cwd: a.CWD})
+			out = append(out, agent{session: s, name: n, status: a.Status, cwd: a.CWD})
 		}
-	}
-	if !asked {
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no session answered")
-		}
-		return nil, lastErr
 	}
 	return out, nil
+}
+
+// harvest captures a worker's recent terminal output onto the task it is working.
+//
+// This is the only part of the system that runs when nobody is awake, and it exists for one
+// moment: a worker finishes at 02:10, nobody reads it, and by morning the pane is gone — a
+// herdr restart, a `/land --all-done`, a laptop that slept — taking the only account of what
+// happened with it. The task then looks abandoned and the work gets offered to somebody else.
+//
+// It reads on `done`, which herdr sets at the end of every turn rather than once at the end of
+// the work, so the snapshot REPLACES rather than appends and an unchanged tail writes nothing.
+// `agent read` is the passive read: it does not clear herdr's own unread flag, so /crew still
+// shows the worker as needing attention.
+//
+// A snapshot is not a result. `cone done --result` is still the deliverable; this is the
+// safety net under it, and it is stored marked unverified and kept out of the search index.
+func (w *Watcher) harvest(ctx context.Context, agents []agent) {
+	doing, err := w.b.List(board.Doing)
+	if err != nil || len(doing) == 0 {
+		return
+	}
+	status := map[string]agent{}
+	for _, a := range agents {
+		status[a.name] = a
+	}
+	for _, t := range doing {
+		a, ok := status[t.Agent]
+		if !ok || a.status != "done" {
+			continue
+		}
+		out, err := w.herdr(ctx, a.session, "agent", "read", a.name,
+			"--source", "recent-unwrapped", "--lines", "200")
+		if err != nil {
+			w.log("could not read %s: %v", a.name, err)
+			continue
+		}
+		changed, err := w.b.Snapshot(t.ID, string(out))
+		if err != nil {
+			w.log("could not store output for %s: %v", t.ID, err)
+			continue
+		}
+		if changed {
+			w.say("captured %s output onto %s", a.name, t.ID)
+		}
+	}
+}
+
+// idleOrchestrators picks the agents sitting in a MAIN checkout. Workers live under a
+// worktrees directory; anything else running an agent is a lead.
+//
+// Only "idle" counts. "done" was accepted here once and should not be: an agent that has
+// finished and exited still lists, and prompting it is a message into a dead pane.
+func idleOrchestrators(agents []agent) []candidate {
+	var out []candidate
+	for _, a := range agents {
+		if strings.Contains(a.cwd, "/worktrees/") || a.status != "idle" {
+			continue
+		}
+		out = append(out, candidate{session: a.session, name: a.name, cwd: a.cwd})
+	}
+	return out
 }
 
 func (w *Watcher) sessions(ctx context.Context) []string {

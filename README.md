@@ -52,6 +52,22 @@ indistinguishable from one with nothing to do.
 Claims held by agents Herdr no longer knows about are released automatically, so a few crashed
 workers cannot hold every slot forever.
 
+## The 2am problem
+
+A worker finishes at 02:10 and nobody reads it. By morning the pane is gone — a restart, a
+teardown, a laptop that slept — and with it the only account of what happened. The task then
+looks abandoned, gets released, and the work is offered to somebody else as if it were new.
+
+So the heartbeat **captures a finished worker's recent output onto its task** while the pane
+still exists, and a task with captured output is held for review rather than re-queued. Only
+work with nothing to show goes back on the queue.
+
+It replaces rather than appends (Herdr marks an agent `done` at the end of every turn, not once
+at the end of the work), it is capped and marked unverified, and **it is kept out of the search
+index** — terminal tail is evidence, not a finding, and it must not compete for rank with what
+an agent actually concluded. The written result is still the deliverable; this is the safety net
+under it.
+
 ```
 launchd / systemd
       │

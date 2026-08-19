@@ -195,15 +195,31 @@ func (b *Board) Reap(herdrBin string, dryRun bool) ([]*Task, error) {
 		if dryRun {
 			continue
 		}
+
+		// A worker that finished at 2am and one that crashed at minute three look identical
+		// from here — both are simply gone. The captured output is the only thing that tells
+		// them apart, and releasing a finished task to ready/ offers work that is already
+		// done to somebody else. Finished-looking work goes to blocked/, where a human reads
+		// the snapshot and closes it; only work with nothing to show is re-offered.
+		verb, to := "Released to ready", Ready
+		if HasWorkerOutput(t.Body) {
+			verb, to = "Held for review; its output is above", Blocked
+		}
 		t.Body = strings.TrimRight(t.Body, "\n") +
-			fmt.Sprintf("\n\n## Abandoned %s\n\nWorker %q is no longer known to Herdr. Released to ready.\n",
-				time.Now().UTC().Format(time.RFC3339), t.Agent)
+			fmt.Sprintf("\n\n## Worker gone %s\n\nWorker %q is no longer known to Herdr. %s.\n",
+				time.Now().UTC().Format(time.RFC3339), t.Agent, verb)
 		if err := b.Save(t); err != nil {
 			continue
 		}
-		if _, err := b.Release(t.ID); err != nil {
+		if to == Ready {
+			if _, err := b.Release(t.ID); err != nil {
+				continue
+			}
+		} else if err := b.move(t, to); err != nil {
+			// Blocked keeps the claim stamps: it is not unowned, it is waiting on a human.
 			continue
 		}
+		b.touchIndex()
 	}
 	return reaped, nil
 }

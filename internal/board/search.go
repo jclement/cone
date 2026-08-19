@@ -114,7 +114,7 @@ func (b *Board) Reindex() (int, error) {
 				upd = t.Completed
 			}
 			if _, err := ins.Exec(t.ID, "task", string(t.State), t.Repo, t.ClaimedBy,
-				t.Path, fmtTime(upd), t.Title, t.Body); err != nil {
+				t.Path, fmtTime(upd), t.Title, withoutWorkerOutput(t.Body)); err != nil {
 				return n, err
 			}
 			n++
