@@ -12,8 +12,8 @@ description = "Build the board binary into ./dist"
 run = "go build -o dist/cone ./cmd/cone"
 
 [tasks.dev]
-description = "Run the watcher against ~/agent in the foreground"
-run = "go run ./cmd/cone watch --verbose"
+description = "Run the watcher against ~/cone in the foreground"
+run = "go run ./cmd/cone watch --verbose --interval 10s"
 
 [tasks.test]
 description = "Full suite, non-interactive"
