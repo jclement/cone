@@ -220,3 +220,169 @@ func TestARepeatedTitleFromAnInboxIsStillFiled(t *testing.T) {
 		t.Fatalf("a second, distinct request from the inbox was lost: %v", err)
 	}
 }
+
+// The reaper keyed on claimed_by, which is a display label — a hostname, an MCP default,
+// whatever a caller passed. None of those can ever appear in `herdr agent list`, so "I cannot
+// see you" was read as "you are dead": the janitor revoked live claims and the heartbeat then
+// offered that work to a second agent. Exactly the duplication the board exists to prevent.
+func TestReapDoesNotTouchAClaimWithNoHerdrIdentity(t *testing.T) {
+	b := tmpBoard(t)
+	task, err := b.New(Task{Title: "long investigation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Promote(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A shell on a laptop: Whoami falls back to the hostname, which herdr never reports.
+	if _, err := b.Claim(task.ID, "quark.local"); err != nil {
+		t.Fatal(err)
+	}
+
+	reaped, err := b.Reap(fakeHerdrBin(t, `{"result":{"agents":[]}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 0 {
+		t.Fatalf("released %d claim(s) held by someone herdr simply cannot see", len(reaped))
+	}
+	held, _ := b.Find(task.ID)
+	if held.State != Doing {
+		t.Fatalf("the task left doing/ — it is now %s, and two agents can hold it", held.State)
+	}
+}
+
+// A claim with a herdr worker behind it IS reapable — that is the case the reaper exists for,
+// and four of them at the default cap stop the heartbeat permanently.
+func TestReapReleasesAClaimWhoseWorkerIsGone(t *testing.T) {
+	b := tmpBoard(t)
+	task, err := b.New(Task{Title: "delegated work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Promote(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Claim(task.ID, "lead"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Set(task.ID, "agent", "be-2175"); err != nil {
+		t.Fatal(err)
+	}
+
+	reaped, err := b.Reap(fakeHerdrBin(t, `{"result":{"agents":[]}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 1 {
+		t.Fatalf("reaped %d, want the one whose worker is gone", len(reaped))
+	}
+	if held, _ := b.Find(task.ID); held.State != Ready {
+		t.Fatalf("the dead claim still holds a worker slot (state %s)", held.State)
+	}
+}
+
+// A worker that is alive keeps its claim, however long it has been running. Slow is not
+// abandoned, and that call is not the reaper's to make.
+func TestReapLeavesALiveWorkerAlone(t *testing.T) {
+	b := tmpBoard(t)
+	task, _ := b.New(Task{Title: "slow work"})
+	b.Promote(task.ID)
+	b.Claim(task.ID, "lead")
+	b.Set(task.ID, "agent", "be-2175")
+
+	reaped, err := b.Reap(fakeHerdrBin(t, `{"result":{"agents":[{"name":"be-2175","agent_status":"working"}]}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 0 {
+		t.Fatal("released a claim held by an agent that is still running")
+	}
+}
+
+// Liveness that is unknown must never read as "nobody is alive". If a session cannot be
+// listed, every agent in it looks dead — and the reaper would release the whole board.
+func TestReapRefusesToActOnAPartialAnswer(t *testing.T) {
+	b := tmpBoard(t)
+	task, _ := b.New(Task{Title: "delegated work"})
+	b.Promote(task.ID)
+	b.Claim(task.ID, "lead")
+	b.Set(task.ID, "agent", "be-2175")
+
+	if _, err := b.Reap(filepath.Join(t.TempDir(), "herdr-that-is-not-there"), false); err == nil {
+		t.Fatal("reaped without being able to ask who is alive")
+	}
+	if held, _ := b.Find(task.ID); held.State != Doing {
+		t.Fatalf("a claim was released while herdr was unreachable (state %s)", held.State)
+	}
+}
+
+// A session whose agents cannot be listed is a session whose agents all look dead. Skipping it
+// and returning the rest is the shape of a bug that releases the whole board.
+func TestReapRefusesWhenOneSessionCannotBeListed(t *testing.T) {
+	b := tmpBoard(t)
+	task, _ := b.New(Task{Title: "delegated work"})
+	b.Promote(task.ID)
+	b.Claim(task.ID, "lead")
+	b.Set(task.ID, "agent", "be-2175") // lives in the session that will not answer
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	os.WriteFile(bin, []byte(`#!/bin/sh
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\nbe running\n' ;;
+  "agent list") printf '{"result":{"agents":[]}}\n' ;;
+esac
+# --session be is the one that fails
+for a in "$@"; do [ "$a" = "be" ] && exit 3; done
+exit 0
+`), 0o755)
+
+	if _, err := b.Reap(bin, false); err == nil {
+		t.Fatal("reaped from an answer that was missing a whole session")
+	}
+	if held, _ := b.Find(task.ID); held.State != Doing {
+		t.Fatalf("released a claim on a partial view of who is alive (state %s)", held.State)
+	}
+}
+
+// Without the session list we would see only the default session — and every agent in every
+// other session would read as dead.
+func TestReapRefusesWhenSessionsCannotBeEnumerated(t *testing.T) {
+	b := tmpBoard(t)
+	task, _ := b.New(Task{Title: "delegated work"})
+	b.Promote(task.ID)
+	b.Claim(task.ID, "lead")
+	b.Set(task.ID, "agent", "be-2175")
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	os.WriteFile(bin, []byte(`#!/bin/sh
+case "$1 $2" in
+  "session list") exit 4 ;;
+  "agent list") printf '{"result":{"agents":[]}}\n' ;;
+esac
+`), 0o755)
+
+	if _, err := b.Reap(bin, false); err == nil {
+		t.Fatal("reaped while unable to enumerate sessions — every non-default agent looked dead")
+	}
+	if held, _ := b.Find(task.ID); held.State != Doing {
+		t.Fatalf("released a claim on a default-session-only view (state %s)", held.State)
+	}
+}
+
+// fakeHerdrBin writes a script that answers `session list` and `agent list` with fixed JSON.
+func fakeHerdrBin(t *testing.T, agentsJSON string) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	script := "#!/bin/sh\ncase \"$1 $2\" in\n" +
+		"  \"session list\") printf 'NAME STATUS\\ndefault running\\n' ;;\n" +
+		"  \"agent list\") printf '%s\\n' '" + agentsJSON + "' ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}

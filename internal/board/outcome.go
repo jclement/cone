@@ -91,8 +91,13 @@ func (b *Board) Set(id, key, value string) (*Task, error) {
 		t.Repo = value
 	case "priority":
 		t.Priority = value
+	case "kind":
+		// Filed over MCP, kind was always the default "investigate" — and CompleteWith
+		// refuses to close one without a result. Without this the only ways out were to
+		// invent a result (poisoning the one thing done/ is for) or abandon the task.
+		t.Kind = value
 	default:
-		return nil, fmt.Errorf("cannot set %q (worktree|agent|branch|repo|priority). "+
+		return nil, fmt.Errorf("cannot set %q (worktree|agent|branch|repo|priority|kind). "+
 			"Other fields are not round-tripped and would be lost on the next write", key)
 	}
 	if err := b.Save(t); err != nil {
@@ -109,27 +114,29 @@ func LiveAgents(herdrBin string) (map[string]bool, error) {
 	if herdrBin == "" {
 		herdrBin = "herdr"
 	}
-	sessions := []string{""}
-	if out, err := exec.Command(herdrBin, "session", "list").Output(); err == nil {
-		sessions = nil
-		for i, line := range strings.Split(string(out), "\n") {
-			f := strings.Fields(line)
-			if i == 0 || len(f) < 2 || f[1] != "running" {
-				continue
-			}
-			if f[0] == "default" {
-				sessions = append(sessions, "")
-			} else {
-				sessions = append(sessions, f[0])
-			}
+	out, err := exec.Command(herdrBin, "session", "list").Output()
+	if err != nil {
+		// Without the session list we would see only the default session, and every agent in
+		// every other session would read as dead. Liveness is unknown, not empty.
+		return nil, fmt.Errorf("could not list herdr sessions: %w", err)
+	}
+	var sessions []string
+	for i, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if i == 0 || len(f) < 2 || f[1] != "running" {
+			continue
 		}
-		if len(sessions) == 0 {
-			sessions = []string{""}
+		if f[0] == "default" {
+			sessions = append(sessions, "")
+		} else {
+			sessions = append(sessions, f[0])
 		}
+	}
+	if len(sessions) == 0 {
+		sessions = []string{""}
 	}
 
 	live := map[string]bool{}
-	asked := false
 	for _, s := range sessions {
 		args := []string{}
 		if s != "" {
@@ -137,28 +144,37 @@ func LiveAgents(herdrBin string) (map[string]bool, error) {
 		}
 		out, err := exec.Command(herdrBin, append(args, "agent", "list")...).Output()
 		if err != nil {
-			continue
+			// One session we cannot read is one whose agents would all look dead. Refuse the
+			// whole answer rather than return a set that is quietly missing a session.
+			return nil, fmt.Errorf("could not list agents in session %q: %w", s, err)
 		}
-		asked = true
 		for _, name := range agentNames(out) {
 			live[name] = true
 		}
 	}
-	if !asked {
-		return nil, fmt.Errorf("could not reach herdr")
-	}
 	return live, nil
 }
 
-// Reap releases claims held by agents Herdr no longer knows about.
+// Reap releases claims whose worker Herdr no longer knows about.
 //
-// This is the difference between a board that recovers overnight and one that wedges. The
-// worker cap counts tasks in doing/, so four dead claims at the default cap stop the heartbeat
-// permanently — and the only trace was a log line that is suppressed unless --verbose, which
-// the installed scheduler does not pass. A dead claim must release itself.
+// A dead claim must release itself: the worker cap counts tasks in doing/, so a few crashed
+// workers stop the heartbeat permanently, and the only trace was a log line suppressed unless
+// --verbose — which the installed scheduler did not pass.
 //
-// A task whose claimant is still live is left entirely alone regardless of age: slow is not
-// the same as abandoned, and that distinction is not the reaper's to make.
+// It keys on `agent`, NOT on `claimed_by`, and that distinction is the whole safety of this
+// function. `claimed_by` is a display label: it can be a hostname (Whoami falls back to one),
+// a name a caller invented, or an operator at a shell. None of those will ever appear in
+// `herdr agent list`, so keying on it meant "I cannot see you" was read as "you are dead" —
+// and the reaper revoked live claims and offered the work to a second agent, which is exactly
+// the duplicated work this board exists to prevent.
+//
+// `agent` is a herdr identity by construction: Claim stamps it from $HERDR_AGENT, and the
+// documented delegation flow sets it to the worker's name. **A task with no `agent` is never
+// reaped** — nobody has said which agent is doing it, so nothing can say it stopped. Those
+// surface through `cone stale` and `cone doctor`, where a human decides.
+//
+// A task whose worker is still live is left entirely alone regardless of age: slow is not the
+// same as abandoned, and that distinction is not the reaper's to make.
 func (b *Board) Reap(herdrBin string, dryRun bool) ([]*Task, error) {
 	live, err := LiveAgents(herdrBin)
 	if err != nil {
@@ -172,7 +188,7 @@ func (b *Board) Reap(herdrBin string, dryRun bool) ([]*Task, error) {
 	}
 	var reaped []*Task
 	for _, t := range doing {
-		if t.ClaimedBy == "" || live[t.ClaimedBy] {
+		if t.Agent == "" || live[t.Agent] {
 			continue
 		}
 		reaped = append(reaped, t)
@@ -180,8 +196,8 @@ func (b *Board) Reap(herdrBin string, dryRun bool) ([]*Task, error) {
 			continue
 		}
 		t.Body = strings.TrimRight(t.Body, "\n") +
-			fmt.Sprintf("\n\n## Abandoned %s\n\nClaimed by %q, which Herdr no longer knows about. Released to ready.\n",
-				time.Now().UTC().Format(time.RFC3339), t.ClaimedBy)
+			fmt.Sprintf("\n\n## Abandoned %s\n\nWorker %q is no longer known to Herdr. Released to ready.\n",
+				time.Now().UTC().Format(time.RFC3339), t.Agent)
 		if err := b.Save(t); err != nil {
 			continue
 		}
@@ -206,7 +222,7 @@ func (b *Board) ActiveClaims(herdrBin string) int {
 	}
 	n := 0
 	for _, t := range doing {
-		if t.ClaimedBy == "" || live[t.ClaimedBy] {
+		if t.Agent == "" || live[t.Agent] {
 			n++
 		}
 	}

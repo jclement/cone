@@ -152,7 +152,12 @@ func (b *Board) New(t Task) (*Task, error) {
 		t.Created = time.Now().UTC()
 	}
 	if t.Body == "" {
-		t.Body = t.Title + "\n\n## Done when\n\n(describe the observable outcome — not \"the code is written\")\n"
+		// Deliberately no "## Done when" placeholder. Emitting one on every task made the
+		// acceptance bar a heading that is always present and usually meaningless: the rule
+		// telling agents to question a vague bar fired on every single task, which is how a
+		// rule stops being applied, and a structural check for the heading passed anyway.
+		// Absent, its absence is information.
+		t.Body = t.Title + "\n"
 	}
 	// An id must be unique across EVERY state, not just the directory being written to.
 	// Checking only inbox lets a new task collide with one already claimed or completed,
@@ -323,6 +328,13 @@ func (b *Board) Claim(id, who string) (*Task, error) {
 		return nil, err
 	}
 	t.ClaimedBy, t.ClaimedAt = who, time.Now().UTC()
+	// Stamp the herdr identity when there is one. This is what makes a claim reapable:
+	// claimed_by is a display label and may be a hostname or anything a caller passed, so a
+	// claim with no herdr identity behind it is deliberately left for a human to judge rather
+	// than released automatically. See Reap.
+	if t.Agent == "" {
+		t.Agent = os.Getenv("HERDR_AGENT")
+	}
 	if err := b.Save(t); err != nil {
 		// Roll back rather than leave an unstamped task in doing/: Stale skips entries with
 		// no claimed_at, so it would occupy a worker slot forever and be reported by nothing.
@@ -375,8 +387,11 @@ func (b *Board) Block(id, why string) (*Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	if t.State != Doing {
-		return nil, fmt.Errorf("only a claimed task can be blocked; %s is %s", id, t.State)
+	// Ready is allowed as well as Doing. A lead that reads a task and sees immediately that
+	// it needs a human decision should be able to say so without first claiming it — and
+	// `/tasks` offers exactly that, so requiring the claim made the documented flow an error.
+	if t.State != Doing && t.State != Ready {
+		return nil, fmt.Errorf("only a ready or claimed task can be blocked; %s is %s", id, t.State)
 	}
 	if why != "" {
 		t.Body = strings.TrimRight(t.Body, "\n") +
@@ -421,9 +436,12 @@ func (b *Board) Save(t *Task) error {
 // returned "no matches" for everything recent. A full rebuild is milliseconds at this scale
 // and cannot drift from the files, which is worth far more than incremental bookkeeping.
 // Indexing failure is never fatal: the files are the truth, the index is a cache.
-func (b *Board) touchIndex() {
-	_, _ = b.Reindex()
-}
+// touchIndex records that the board changed. It deliberately does NOT rebuild the index:
+// Reindex is O(every file on the board), and calling it from every mutation made a single
+// `cone note` re-parse and re-insert the entire history — with the heartbeat triggering it
+// every minute. Search rebuilds on read when the files are newer than the index, which is
+// also correct for changes this binary never saw.
+func (b *Board) touchIndex() {}
 
 // Stale reports tasks claimed longer ago than d. It reports only: whether a claim is
 // abandoned or merely slow is a judgement an agent should not make unilaterally.

@@ -1,6 +1,7 @@
 package board
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,5 +92,62 @@ func TestDoctorIsQuietOnAHealthyBoard(t *testing.T) {
 	}
 	if got := findings(b.Doctor(""), Broken); len(got) != 0 {
 		t.Fatalf("a healthy board reported problems: %v", got)
+	}
+}
+
+// The index was rebuilt from scratch on every mutation — O(every file on the board) per write,
+// with the heartbeat triggering it every minute. It is rebuilt on read instead, which has to
+// stay correct for files this binary never saw.
+func TestSearchRebuildsWhenTheFilesAreNewerThanTheIndex(t *testing.T) {
+	b := tmpBoard(t)
+	if _, err := b.New(Task{Title: "the first thing", Body: "about widgets\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Search("widgets", 10); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second task written the way an agent with `mv` and `cat` would write it — never
+	// through this binary, so nothing marked the index dirty.
+	raw := "---\nid: 20260819-hand-written\ntitle: hand written\nkind: chore\n---\n\nabout sprockets\n"
+	if err := os.WriteFile(filepath.Join(b.dir(Ready), "20260819-hand-written.md"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := b.Search("sprockets", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("a task written directly to disk is invisible to search — the index is not rebuilt on read")
+	}
+}
+
+// The index is a cache; a write must not pay for a full rebuild.
+func TestWritingATaskDoesNotRebuildTheIndex(t *testing.T) {
+	b := tmpBoard(t)
+	if _, err := b.New(Task{Title: "the first thing"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Search("first", 10); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(b.IndexPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := b.New(Task{Title: fmt.Sprintf("another thing %d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	after, err := os.Stat(b.IndexPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("filing a task rebuilt the whole search index")
 	}
 }

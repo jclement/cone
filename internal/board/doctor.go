@@ -170,19 +170,38 @@ func (b *Board) checkClaims(herdrBin string) []Finding {
 			fmt.Sprintf("cannot ask herdr who is alive (%v), so %d claim(s) cannot be checked", err, len(doing)), ""}}
 	}
 
-	var dead []string
+	var dead, unowned []string
 	for _, t := range doing {
-		if t.ClaimedBy != "" && !live[t.ClaimedBy] {
+		switch {
+		case t.Agent == "":
+			// The reaper will not touch these, deliberately — nothing can say a worker
+			// stopped when nobody said which worker started. So they are reported here
+			// instead, because otherwise they hold a slot and no command anywhere mentions
+			// them until the cap wedges.
+			unowned = append(unowned, t.ID)
+		case !live[t.Agent]:
 			dead = append(dead, t.ID)
 		}
 	}
-	if len(dead) == 0 {
-		return []Finding{{OK, "claims", fmt.Sprintf("%d claim(s) in flight, all held by live agents", len(doing)), ""}}
-	}
 	sort.Strings(dead)
-	return []Finding{{Broken, "claims",
-		fmt.Sprintf("%d claim(s) held by agents herdr no longer knows about: %s", len(dead), strings.Join(dead, ", ")),
-		"cone reap"}}
+	sort.Strings(unowned)
+
+	var out []Finding
+	if len(dead) > 0 {
+		out = append(out, Finding{Broken, "claims",
+			fmt.Sprintf("%d claim(s) whose worker herdr no longer knows about: %s", len(dead), strings.Join(dead, ", ")),
+			"cone reap"})
+	}
+	if len(unowned) > 0 {
+		out = append(out, Finding{Warn, "claims",
+			fmt.Sprintf("%d claim(s) with no agent recorded, so nothing can ever release them: %s",
+				len(unowned), strings.Join(unowned, ", ")),
+			"cone set <id> agent <name>, or cone back <id> if nobody is working it"})
+	}
+	if len(out) == 0 {
+		out = append(out, Finding{OK, "claims", fmt.Sprintf("%d claim(s) in flight, all held by live workers", len(doing)), ""})
+	}
+	return out
 }
 
 func (b *Board) checkIndex() []Finding {

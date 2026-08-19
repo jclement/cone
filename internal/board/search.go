@@ -72,8 +72,11 @@ type Hit struct {
 	Snippet string
 }
 
-// Reindex rebuilds the whole index from disk. Cheap at this scale and always correct, which
-// beats incremental bookkeeping that can silently drift from the files.
+// Reindex rebuilds the whole index from disk. Always correct, which beats incremental
+// bookkeeping that can silently drift from the files — but it is O(every task on the board),
+// so it runs on READ when the board has changed, never on every write. It used to be called
+// from every mutation: one `cone note` on a board with 500 completed tasks re-parsed all 500
+// files and rebuilt the whole table, and the heartbeat triggered that every minute.
 func (b *Board) Reindex() (int, error) {
 	idx, err := b.OpenIndex()
 	if err != nil {
@@ -130,6 +133,34 @@ func (b *Board) Reindex() (int, error) {
 	return n, tx.Commit()
 }
 
+// indexIsStale compares the index against the newest thing on disk. A missing index is stale
+// by definition; so is one older than any task file, which is what makes deferring the rebuild
+// to read time safe — including when another agent, or a human with an editor, changed a file
+// without going through this binary at all.
+func (b *Board) indexIsStale() bool {
+	st, err := os.Stat(b.IndexPath())
+	if err != nil {
+		return true
+	}
+	dirs := []string{b.boardDir()}
+	for _, s := range States {
+		dirs = append(dirs, b.dir(s))
+	}
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			info, err := e.Info()
+			if err == nil && info.ModTime().After(st.ModTime()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Search runs an FTS5 query. Bare words are ANDed; FTS5 operators (OR, NEAR, "quoted
 // phrase", prefix*) all work, which is why the query is passed through rather than escaped
 // into uselessness.
@@ -137,7 +168,7 @@ func (b *Board) Search(query string, limit int) ([]Hit, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("empty query")
 	}
-	if _, err := os.Stat(b.IndexPath()); os.IsNotExist(err) {
+	if b.indexIsStale() {
 		if _, err := b.Reindex(); err != nil {
 			return nil, err
 		}
