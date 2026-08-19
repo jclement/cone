@@ -24,8 +24,13 @@ race for the same task and exactly one wins, with no daemon, no database and no 
 losers get an error, never a second copy and never a clobbered file. That property is tested,
 not assumed.
 
-The consequence that matters: **any agent can participate with nothing but `mv` and `cat`.**
-This binary is a convenience, never a gatekeeper.
+**The consequence that matters: the protocol is a filesystem, not an API.** Any tool, in any
+language, on any host that can hard-link a file can implement a claim correctly —
+`ln ready/x.md doing/x.md && rm ready/x.md`, in that order, is the whole lock. What is *not*
+safe is `mv`: it succeeds unconditionally, so two agents that both `mv` both believe they won,
+and a task that lands in `doing/` without a `claimed_by` stamp is invisible to `stale`, `reap`
+and the worker cap alike. Agents should use `cone claim`; this binary is a convenience, but the
+link-then-unlink order is not.
 
 ## The heartbeat
 
