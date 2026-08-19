@@ -1,5 +1,7 @@
-dist/
-board
+# Anchored to the repo root: an unanchored pattern matches ANY path component, and a bare
+# `board` line silently excluded internal/board/ — which only surfaced as a CI build failure.
+/dist/
+/cone
 *.test
 .DS_Store
 mise.local.toml
