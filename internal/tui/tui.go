@@ -43,6 +43,7 @@ type model struct {
 	update   string
 	isErr    bool
 	detail   bool
+	pending  string // a destructive key awaiting its second press: "d:<id>"
 	w, h     int
 	quitting bool
 }
@@ -60,6 +61,12 @@ func Run(b *board.Board, upd *selfupdate.Check) error {
 }
 
 func (m *model) reload() {
+	// Remember the task, not the row. Every mutation reorders the list — completing the row
+	// above you slides a different task under the cursor, and the next keypress acts on it.
+	var was string
+	if r := m.sel(); r != nil {
+		was = r.task.ID
+	}
 	m.rows = nil
 	for _, s := range board.States {
 		if s == board.Done {
@@ -71,6 +78,14 @@ func (m *model) reload() {
 		}
 		for _, t := range list {
 			m.rows = append(m.rows, row{task: t, state: s})
+		}
+	}
+	if was != "" {
+		for i, r := range m.rows {
+			if r.task.ID == was {
+				m.cur = i
+				break
+			}
 		}
 	}
 	if m.cur >= len(m.rows) {
@@ -100,6 +115,20 @@ func (m *model) sel() *row {
 		return nil
 	}
 	return &m.rows[m.cur]
+}
+
+// confirmed gates a destructive key behind a second press of the same key on the same task.
+// d and b sit next to j and k; a fat finger completed someone else's task with no undo, and
+// there is no undo to add — done/ is a directory, not a transaction log.
+func (m *model) confirmed(key, id, what string) bool {
+	want := key + ":" + id
+	if m.pending == want {
+		m.pending = ""
+		return true
+	}
+	m.pending = want
+	m.say("press %s again to %s", key, what)
+	return false
 }
 
 func (m *model) say(format string, a ...any) { m.status, m.isErr = fmt.Sprintf(format, a...), false }
@@ -148,23 +177,42 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case "d": // done
-			if r := m.sel(); r != nil {
-				if _, err := m.b.Complete(r.task.ID); err != nil {
-					m.oops(err)
-				} else {
-					m.say("%s done", r.task.ID)
-					m.reload()
-				}
+			r := m.sel()
+			if r == nil {
+				break
+			}
+			// An investigation must record what it found, and there is nowhere to type it
+			// here. Sending people to the CLI is better than a TUI that quietly files an
+			// empty result — which is exactly the hole this refusal exists to close.
+			if r.task.Kind == "investigate" {
+				m.oops(fmt.Errorf("%s is an investigation — finish it with: cone done %s --result \"…\"", r.task.ID, r.task.ID))
+				break
+			}
+			if !m.confirmed("d", r.task.ID, "complete "+r.task.ID) {
+				break
+			}
+			if _, err := m.b.CompleteWith(r.task.ID, ""); err != nil {
+				m.oops(err)
+			} else {
+				m.say("%s done", r.task.ID)
+				m.reload()
 			}
 		case "b": // back / release
-			if r := m.sel(); r != nil {
-				if _, err := m.b.Release(r.task.ID); err != nil {
-					m.oops(err)
-				} else {
-					m.say("released %s", r.task.ID)
-					m.reload()
-				}
+			r := m.sel()
+			if r == nil {
+				break
 			}
+			if !m.confirmed("b", r.task.ID, "release "+r.task.ID) {
+				break
+			}
+			if _, err := m.b.Release(r.task.ID); err != nil {
+				m.oops(err)
+			} else {
+				m.say("released %s", r.task.ID)
+				m.reload()
+			}
+		default:
+			m.pending = "" // any other key cancels a pending confirmation
 		}
 	}
 	return m, nil
@@ -226,6 +274,7 @@ func (m *model) View() string {
 		b.WriteString(" " + cWarn.Render(m.update) + "\n")
 	}
 	b.WriteString(cDim.Render(" ↑↓ move · enter detail · p promote · c claim · d done · b release · r reload · q quit") + "\n")
+	b.WriteString(cDim.Render(" d and b ask for a second press") + "\n")
 	return b.String()
 }
 

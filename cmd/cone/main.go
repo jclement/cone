@@ -274,7 +274,14 @@ func cmdList(args []string) error {
 	}
 	want := board.States
 	if len(args) > 0 && args[0] != "all" {
-		want = []board.State{board.State(args[0])}
+		// A misspelt state listed an empty directory and printed "nothing here", which is
+		// indistinguishable from a genuinely empty queue — the worst possible answer to
+		// "what is waiting?".
+		st := board.State(args[0])
+		if !validState(st) {
+			return fmt.Errorf("no such state %q (%s, or all)", args[0], strings.Join(stateNames(), ", "))
+		}
+		want = []board.State{st}
 	} else if len(args) == 0 {
 		want = []board.State{board.Ready}
 	}
@@ -297,10 +304,35 @@ func cmdList(args []string) error {
 		}
 	}
 	if total == 0 {
-		fmt.Println("nothing here")
+		if len(want) == 1 {
+			fmt.Printf("%s is empty\n", want[0])
+		} else {
+			fmt.Println("the board is empty")
+		}
 		return nil
 	}
 	return tw.Flush()
+}
+
+func validState(s board.State) bool {
+	for _, x := range board.States {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// stateNames renders states for a message; with no arguments it names every state.
+func stateNames(states ...board.State) []string {
+	if len(states) == 0 {
+		states = board.States
+	}
+	out := make([]string, len(states))
+	for i, s := range states {
+		out[i] = string(s)
+	}
+	return out
 }
 
 func cmdShow(args []string) error {
