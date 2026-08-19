@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,7 +61,16 @@ func Sync(ctx context.Context, b *board.Board, sources []Source) ([]*board.Task,
 			t.Source = s.Name()
 			nt, err := b.New(t)
 			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", s.Name(), err))
+				// The upstream claim already removed this from the human's queue and there
+				// is no release endpoint here, so a failure to file means the request exists
+				// nowhere: not on their phone, not on the board. Quarantine it instead —
+				// `cone doctor` reports the directory, and the file is a task ready to be
+				// moved into inbox/ by hand.
+				if qerr := quarantine(b, t, err); qerr != nil {
+					errs = append(errs, fmt.Sprintf("%s: %v (AND could not quarantine it: %v)", s.Name(), err, qerr))
+				} else {
+					errs = append(errs, fmt.Sprintf("%s: %v — quarantined, not lost", s.Name(), err))
+				}
 				continue
 			}
 			seen[key] = true
@@ -76,6 +86,27 @@ func Sync(ctx context.Context, b *board.Board, sources []Source) ([]*board.Task,
 		return filed, fmt.Errorf("sync had problems: %s", strings.Join(errs, "; "))
 	}
 	return filed, nil
+}
+
+// QuarantineDir holds tasks that were claimed upstream but could not be filed. Nothing else
+// remembers them: claiming on these endpoints is destructive and there is no release call.
+func QuarantineDir(b *board.Board) string { return filepath.Join(b.Root, "inbox-quarantine") }
+
+func quarantine(b *board.Board, t board.Task, cause error) error {
+	dir := QuarantineDir(b)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	t.Body = strings.TrimRight(t.Body, "\n") +
+		fmt.Sprintf("\n\n## Could not be filed\n\n%v\n\nClaimed from %s (%s) and removed from that queue, "+
+			"so this file is the only copy. Fix the cause and move it into tasks/inbox/.\n", cause, t.Source, t.SourceRef)
+	name := t.Source + "-" + strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, t.SourceRef) + ".md"
+	return os.WriteFile(filepath.Join(dir, name), []byte(t.Marshal()), 0o644)
 }
 
 func seenRefs(b *board.Board) (map[string]bool, error) {

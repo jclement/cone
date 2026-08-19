@@ -56,6 +56,13 @@ func Doctor(root string) []board.Finding {
 			Fix:     "cone install"})
 	}
 
+	// Tasks claimed from a human's queue that could not be filed exist nowhere else.
+	if entries, err := os.ReadDir(filepath.Join(root, "inbox-quarantine")); err == nil && len(entries) > 0 {
+		f = append(f, board.Finding{Severity: board.Broken, Area: "inbox",
+			Message: fmt.Sprintf("%d task(s) in inbox-quarantine/ — claimed from an inbox, never filed, and that queue no longer has them", len(entries)),
+			Fix:     "read them and move each into tasks/inbox/"})
+	}
+
 	// The log is the only evidence the thing runs. Zero bytes is the signature of the bug
 	// above: loaded, retried every 30 seconds, silent the whole time.
 	logPath := filepath.Join(root, ".watch.log")
