@@ -1,6 +1,7 @@
 package board
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,6 +54,7 @@ func (b *Board) Doctor(herdrBin string) []Finding {
 	out = append(out, b.checkStates()...)
 	out = append(out, b.checkClaims(herdrBin)...)
 	out = append(out, b.checkIndex()...)
+	out = append(out, checkOrchestrators(herdrBin)...)
 	return out
 }
 
@@ -200,6 +202,48 @@ func (b *Board) checkClaims(herdrBin string) []Finding {
 	}
 	if len(out) == 0 {
 		out = append(out, Finding{OK, "claims", fmt.Sprintf("%d claim(s) in flight, all held by live workers", len(doing)), ""})
+	}
+	return out
+}
+
+// checkOrchestrators answers the question that has no other answer: **is there anything the
+// heartbeat could actually wake?**
+//
+// The failure is silent and easy to walk into. `cone watch` finds leads through
+// `herdr agent list`, so a Claude you started yourself in a plain terminal is invisible to it —
+// the board fills up, the watcher runs perfectly, and nothing is ever poked, which looks
+// exactly like having nothing to do. Nothing else in the system reports that, because from
+// every other angle both halves are healthy.
+func checkOrchestrators(herdrBin string) []Finding {
+	agents, err := Agents(context.Background(), herdrBin)
+	if err != nil {
+		return []Finding{{Warn, "orchestrators",
+			fmt.Sprintf("cannot ask herdr who is running (%v), so nothing can be woken", err), ""}}
+	}
+
+	var leads, idle []string
+	for _, a := range agents {
+		if !a.IsLead() {
+			continue
+		}
+		leads = append(leads, fmt.Sprintf("%s (%s, %s)", a.Name, a.Status, a.CWD))
+		if a.Status == "idle" {
+			idle = append(idle, a.Name)
+		}
+	}
+	sort.Strings(leads)
+
+	if len(leads) == 0 {
+		return []Finding{{Warn, "orchestrators",
+			"herdr knows of no agent in a main checkout, so the heartbeat has nobody to wake — " +
+				"a `claude` started in a plain terminal is invisible to it",
+			"start leads through herdr (`herdr agent start <name> --kind claude --pane <id>`)"}}
+	}
+	out := []Finding{{OK, "orchestrators",
+		fmt.Sprintf("%d lead(s) visible to herdr: %s", len(leads), strings.Join(leads, ", ")), ""}}
+	if len(idle) == 0 {
+		out = append(out, Finding{OK, "orchestrators",
+			"none idle right now — work waiting will be offered when one frees up", ""})
 	}
 	return out
 }

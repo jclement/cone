@@ -178,12 +178,17 @@ to `brew upgrade cone`.
 
 ## When it looks like nothing is happening
 
+`cone watch` finds leads through `herdr agent list`, so **an agent Herdr did not start is
+invisible to it** — the board fills up, the watcher runs perfectly, and nothing is ever woken,
+which looks exactly like having nothing to do. `cone doctor` names the leads it can see, so that
+failure is a line of output rather than a silence.
+
 ```sh
 cone doctor
 ```
 
-It reads every task file directly rather than through the board, because `List` skips what it
-cannot parse — a broken task is invisible exactly when you are asking why it never came up. It
+It also reads every task file directly rather than through the board, because `List` skips what
+it cannot parse — a broken task is invisible exactly when you are asking why it never came up. It
 also checks the half that lives outside the board: that the scheduler unit exists, that every
 absolute path it names still does (a `brew upgrade` used to delete one), and that the watcher
 has actually written to its log. **"Loaded" is not "working."** Exit code 1 when something is

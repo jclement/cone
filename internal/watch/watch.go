@@ -171,7 +171,7 @@ func (w *Watcher) Tick(ctx context.Context) {
 		return
 	}
 
-	agents, aerr := w.inventory(ctx)
+	agents, aerr := board.Agents(ctx, w.opt.HerdrBin)
 	if aerr != nil {
 		w.hold("cannot ask herdr (%s) who is running: %v", w.opt.HerdrBin, aerr)
 		return
@@ -307,47 +307,6 @@ func signature(tasks []*board.Task) string {
 
 type candidate struct{ session, name, cwd string }
 
-// agent is one row of `herdr agent list`, in whichever session it was found.
-type agent struct {
-	session, name, status, cwd string
-}
-
-// inventory asks every running session who it has. It is the one expensive call in a tick, so
-// harvesting and the idle-lead search share it.
-//
-// A session that cannot be listed fails the whole inventory rather than being skipped: agents
-// in it would read as absent, and "absent" is what makes a claim look abandoned.
-func (w *Watcher) inventory(ctx context.Context) ([]agent, error) {
-	var out []agent
-	for _, s := range w.sessions(ctx) {
-		raw, err := w.herdr(ctx, s, "agent", "list")
-		if err != nil {
-			return nil, fmt.Errorf("session %q: %w", s, err)
-		}
-		var env struct {
-			Result struct {
-				Agents []struct {
-					Name   string `json:"name"`
-					PaneID string `json:"pane_id"`
-					Status string `json:"agent_status"`
-					CWD    string `json:"cwd"`
-				} `json:"agents"`
-			} `json:"result"`
-		}
-		if json.Unmarshal(raw, &env) != nil {
-			continue
-		}
-		for _, a := range env.Result.Agents {
-			n := a.Name
-			if n == "" {
-				n = a.PaneID
-			}
-			out = append(out, agent{session: s, name: n, status: a.Status, cwd: a.CWD})
-		}
-	}
-	return out, nil
-}
-
 // harvest captures a worker's recent terminal output onto the task it is working.
 //
 // This is the only part of the system that runs when nobody is awake, and it exists for one
@@ -362,24 +321,24 @@ func (w *Watcher) inventory(ctx context.Context) ([]agent, error) {
 //
 // A snapshot is not a result. `cone done --result` is still the deliverable; this is the
 // safety net under it, and it is stored marked unverified and kept out of the search index.
-func (w *Watcher) harvest(ctx context.Context, agents []agent) {
+func (w *Watcher) harvest(ctx context.Context, agents []board.Agent) {
 	doing, err := w.b.List(board.Doing)
 	if err != nil || len(doing) == 0 {
 		return
 	}
-	status := map[string]agent{}
+	status := map[string]board.Agent{}
 	for _, a := range agents {
-		status[a.name] = a
+		status[a.Name] = a
 	}
 	for _, t := range doing {
 		a, ok := status[t.Agent]
-		if !ok || a.status != "done" {
+		if !ok || a.Status != "done" {
 			continue
 		}
-		out, err := w.herdr(ctx, a.session, "agent", "read", a.name,
+		out, err := w.herdr(ctx, a.Session, "agent", "read", a.Name,
 			"--source", "recent-unwrapped", "--lines", "200")
 		if err != nil {
-			w.log("could not read %s: %v", a.name, err)
+			w.log("could not read %s: %v", a.Name, err)
 			continue
 		}
 		changed, err := w.b.Snapshot(t.ID, string(out))
@@ -388,7 +347,7 @@ func (w *Watcher) harvest(ctx context.Context, agents []agent) {
 			continue
 		}
 		if changed {
-			w.say("captured %s output onto %s", a.name, t.ID)
+			w.say("captured %s output onto %s", a.Name, t.ID)
 		}
 	}
 }
@@ -398,13 +357,13 @@ func (w *Watcher) harvest(ctx context.Context, agents []agent) {
 //
 // Only "idle" counts. "done" was accepted here once and should not be: an agent that has
 // finished and exited still lists, and prompting it is a message into a dead pane.
-func idleOrchestrators(agents []agent) []candidate {
+func idleOrchestrators(agents []board.Agent) []candidate {
 	var out []candidate
 	for _, a := range agents {
-		if strings.Contains(a.cwd, "/worktrees/") || a.status != "idle" {
+		if !a.IsLead() || a.Status != "idle" {
 			continue
 		}
-		out = append(out, candidate{session: a.session, name: a.name, cwd: a.cwd})
+		out = append(out, candidate{session: a.Session, name: a.Name, cwd: a.CWD})
 	}
 	return out
 }

@@ -3,6 +3,7 @@ package board
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,5 +150,52 @@ func TestWritingATaskDoesNotRebuildTheIndex(t *testing.T) {
 	}
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Fatal("filing a task rebuilt the whole search index")
+	}
+}
+
+// A worker sits in a linked worktree; a lead sits in a main checkout. The test used to be the
+// string "/worktrees/", which silently missed the older layouts on this machine —
+// ~/Developer/barreleye.wt/review read as a lead, so the heartbeat would have offered it work
+// meant for the session that delegates.
+func TestALinkedWorktreeIsNotALead(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("needs git")
+	}
+	root := t.TempDir()
+	main := filepath.Join(root, "repo")
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(main, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(main, "f"), []byte("x"), 0o644)
+	run(main, "add", "f")
+	run(main, "commit", "-qm", "one")
+
+	// A worktree whose path contains no hint of what it is — the case the string test missed.
+	wt := filepath.Join(root, "elsewhere", "review")
+	run(main, "worktree", "add", "-q", "-b", "review", wt)
+
+	if !(Agent{CWD: main}).IsLead() {
+		t.Error("the main checkout was not recognised as a lead")
+	}
+	if (Agent{CWD: wt}).IsLead() {
+		t.Errorf("%s is a linked worktree and was treated as a lead", wt)
+	}
+	// Somewhere that is not a repository at all is still a lead — an agent parked in ~ or
+	// /tmp is not a worker.
+	if !(Agent{CWD: t.TempDir()}).IsLead() {
+		t.Error("a directory that is not a repository was treated as a worktree")
+	}
+	if (Agent{CWD: ""}).IsLead() != true {
+		t.Error("an unknown cwd should not be assumed to be a worktree")
 	}
 }

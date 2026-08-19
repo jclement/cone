@@ -1,6 +1,7 @@
 package board
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -107,50 +108,128 @@ func (b *Board) Set(id, key, value string) (*Task, error) {
 	return t, nil
 }
 
-// LiveAgents returns the set of agent names Herdr currently knows about, across every session.
-// An empty set with no error means Herdr answered and there are none; an error means we could
-// not ask, which callers must treat as "unknown", never as "none".
-func LiveAgents(herdrBin string) (map[string]bool, error) {
+// Agent is one row of `herdr agent list`, in whichever session it was found.
+type Agent struct {
+	Session string
+	Name    string // the agent name, or its pane id when it has none
+	Status  string // idle | working | done | unknown
+	CWD     string
+}
+
+// IsLead reports whether this agent is an orchestrator rather than a worker: a worker sits in
+// a linked worktree, a lead sits in a main checkout.
+//
+// It asks git rather than matching on the path. The string test was "/worktrees/", which
+// silently missed every checkout under the older layouts — `~/Developer/barreleye.wt/review`
+// read as a lead, so the heartbeat would offer it tasks and a worker would be handed work
+// meant for the session that delegates it. Worktrees on this machine live under at least
+// three different naming schemes; git knows which are linked and no pattern does.
+func (a Agent) IsLead() bool { return !isLinkedWorktree(a.CWD) }
+
+// isLinkedWorktree is true for a checkout whose git directory is not the repository's common
+// one — the definition of a linked worktree. A path that is not a repository at all is not a
+// worktree, so an agent parked in ~ or /tmp still counts as a lead.
+func isLinkedWorktree(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	if strings.Contains(dir, "/worktrees/") {
+		return true // fast path for the common layout; also correct when git is unavailable
+	}
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--absolute-git-dir", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return false
+	}
+	lines := strings.Fields(string(out))
+	if len(lines) != 2 {
+		return false
+	}
+	return lines[0] != lines[1]
+}
+
+// Agents asks every running Herdr session who it has.
+//
+// A session that cannot be listed fails the WHOLE call rather than being skipped: its agents
+// would read as absent, and "absent" is what makes a claim look abandoned. Callers must treat
+// an error as "unknown", never as "none".
+func Agents(ctx context.Context, herdrBin string) ([]Agent, error) {
 	if herdrBin == "" {
 		herdrBin = "herdr"
 	}
-	out, err := exec.Command(herdrBin, "session", "list").Output()
+	sessions, err := sessions(ctx, herdrBin)
+	if err != nil {
+		return nil, err
+	}
+	var out []Agent
+	for _, s := range sessions {
+		args := []string{}
+		if s != "" {
+			args = append(args, "--session", s)
+		}
+		raw, err := exec.CommandContext(ctx, herdrBin, append(args, "agent", "list")...).Output()
+		if err != nil {
+			return nil, fmt.Errorf("could not list agents in session %q: %w", s, err)
+		}
+		var env struct {
+			Result struct {
+				Agents []struct {
+					Name   string `json:"name"`
+					PaneID string `json:"pane_id"`
+					Status string `json:"agent_status"`
+					CWD    string `json:"cwd"`
+				} `json:"agents"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(raw, &env) != nil {
+			continue
+		}
+		for _, a := range env.Result.Agents {
+			n := a.Name
+			if n == "" {
+				n = a.PaneID
+			}
+			out = append(out, Agent{Session: s, Name: n, Status: a.Status, CWD: a.CWD})
+		}
+	}
+	return out, nil
+}
+
+func sessions(ctx context.Context, herdrBin string) ([]string, error) {
+	out, err := exec.CommandContext(ctx, herdrBin, "session", "list").Output()
 	if err != nil {
 		// Without the session list we would see only the default session, and every agent in
 		// every other session would read as dead. Liveness is unknown, not empty.
 		return nil, fmt.Errorf("could not list herdr sessions: %w", err)
 	}
-	var sessions []string
+	var names []string
 	for i, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
 		if i == 0 || len(f) < 2 || f[1] != "running" {
 			continue
 		}
 		if f[0] == "default" {
-			sessions = append(sessions, "")
+			names = append(names, "")
 		} else {
-			sessions = append(sessions, f[0])
+			names = append(names, f[0])
 		}
 	}
-	if len(sessions) == 0 {
-		sessions = []string{""}
+	if len(names) == 0 {
+		names = []string{""}
 	}
+	return names, nil
+}
 
+// LiveAgents returns the set of agent names Herdr currently knows about, across every session.
+// An empty set with no error means Herdr answered and there are none; an error means we could
+// not ask, which callers must treat as "unknown", never as "none".
+func LiveAgents(herdrBin string) (map[string]bool, error) {
+	agents, err := Agents(context.Background(), herdrBin)
+	if err != nil {
+		return nil, err
+	}
 	live := map[string]bool{}
-	for _, s := range sessions {
-		args := []string{}
-		if s != "" {
-			args = append(args, "--session", s)
-		}
-		out, err := exec.Command(herdrBin, append(args, "agent", "list")...).Output()
-		if err != nil {
-			// One session we cannot read is one whose agents would all look dead. Refuse the
-			// whole answer rather than return a set that is quietly missing a session.
-			return nil, fmt.Errorf("could not list agents in session %q: %w", s, err)
-		}
-		for _, name := range agentNames(out) {
-			live[name] = true
-		}
+	for _, a := range agents {
+		live[a.Name] = true
 	}
 	return live, nil
 }
@@ -250,31 +329,4 @@ func (b *Board) ActiveClaims(herdrBin string) int {
 		}
 	}
 	return n
-}
-
-// agentNames pulls agent identifiers out of `herdr agent list` JSON. It reads both `name` and
-// `pane_id` because an agent started by hand has no name, and a claim recorded against a pane
-// id must still count as live.
-func agentNames(raw []byte) []string {
-	var env struct {
-		Result struct {
-			Agents []struct {
-				Name   string `json:"name"`
-				PaneID string `json:"pane_id"`
-			} `json:"agents"`
-		} `json:"result"`
-	}
-	if json.Unmarshal(raw, &env) != nil {
-		return nil
-	}
-	var out []string
-	for _, a := range env.Result.Agents {
-		if a.Name != "" {
-			out = append(out, a.Name)
-		}
-		if a.PaneID != "" {
-			out = append(out, a.PaneID)
-		}
-	}
-	return out
 }
