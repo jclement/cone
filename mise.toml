@@ -1,0 +1,36 @@
+# cone — the agent coordination board. Files are the protocol; this is the tool.
+
+[tools]
+go = "latest"
+
+[tasks.setup]
+description = "Fetch dependencies and build once"
+run = ["go mod tidy", "mise run build"]
+
+[tasks.build]
+description = "Build the board binary into ./dist"
+run = "go build -o dist/cone ./cmd/cone"
+
+[tasks.dev]
+description = "Run the watcher against ~/agent in the foreground"
+run = "go run ./cmd/cone watch --verbose"
+
+[tasks.test]
+description = "Full suite, non-interactive"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Vet + format check. Read-only — never writes"
+run = ["go vet ./...", "test -z \"$(gofmt -l .)\" || { gofmt -l .; echo 'unformatted files above'; exit 1; }"]
+
+[tasks.fmt]
+description = "The mutating counterpart of lint"
+run = "gofmt -w ."
+
+[tasks.check]
+description = "Everything that must pass before a change is done"
+depends = ["lint", "test"]
+
+[tasks.install]
+description = "Build, install to ~/.local/bin, and wire the platform scheduler"
+run = ["mise run build", "./dist/cone install"]

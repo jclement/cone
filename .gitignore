@@ -1,0 +1,5 @@
+dist/
+board
+*.test
+.DS_Store
+mise.local.toml
