@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jclement/cone/internal/board"
@@ -141,5 +143,135 @@ func TestAnyOtherKeyStandsTheConfirmationDown(t *testing.T) {
 	m = press(m, "x")
 	if m.pending != "" {
 		t.Fatalf("a confirmation stayed armed through an unrelated key: %q", m.pending)
+	}
+}
+
+// The board was a snapshot of whenever you opened it: no timer, so it redrew only when you
+// acted. Watching it work meant tailing a dotfile nobody knew was there.
+func TestTheBoardRefreshesOnItsOwn(t *testing.T) {
+	m := testModel(t, board.Task{Title: "first"})
+	if m.Init() == nil {
+		t.Fatal("no commands scheduled at startup — nothing drives a refresh")
+	}
+
+	before := len(m.rows)
+	if _, err := m.b.New(board.Task{Title: "filed while you were looking at the screen"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.rows) != before {
+		t.Fatal("test is not measuring what it thinks: rows changed without a tick")
+	}
+
+	updated, cmd := m.Update(tickMsg(time.Now()))
+	if len(updated.(*model).rows) != before+1 {
+		t.Error("a task filed by another agent never appeared")
+	}
+	if cmd == nil {
+		t.Error("the tick did not schedule the next one — it refreshes once and then stops")
+	}
+}
+
+// A live redraw must never eat the message you are reading, or the confirmation you are
+// halfway through giving. d and b sit next to j and k for a reason.
+func TestATickDoesNotDisturbWhatYouAreDoing(t *testing.T) {
+	m := testModel(t, board.Task{Title: "one"})
+	m.say("press d again to complete something")
+	m.pending = "d:some-id"
+
+	updated, _ := m.Update(tickMsg(time.Now()))
+	got := updated.(*model)
+	if got.pending != "d:some-id" {
+		t.Error("a background refresh cancelled a pending confirmation")
+	}
+	if !strings.Contains(got.status, "press d again") {
+		t.Errorf("a background refresh cleared the status line: %q", got.status)
+	}
+}
+
+// The difference between a row that looks busy and one that is.
+func TestAClaimShowsWhatItsWorkerIsDoing(t *testing.T) {
+	m := testModel(t, board.Task{Title: "delegated"})
+	if _, err := m.b.Set(m.rows[0].task.ID, "agent", "be-2175"); err != nil {
+		t.Fatal(err)
+	}
+	m.reload()
+
+	for _, c := range []struct{ status, want string }{
+		{"working", "working"},
+		{"done", "finished"},
+		{"", "gone"},
+	} {
+		m.agents = map[string]string{"be-2175": c.status}
+		if c.status == "" {
+			m.agents = map[string]string{"someone-else": "idle"}
+		}
+		if got := m.worker(m.rows[0]); !strings.Contains(got, c.want) {
+			t.Errorf("herdr says %q, board shows %q, want it to mention %q", c.status, got, c.want)
+		}
+	}
+}
+
+// Before herdr has answered, saying nothing beats guessing — an un-annotated claim is honest,
+// "worker gone" on a healthy worker is not.
+func TestNoWorkerAnnotationBeforeHerdrAnswers(t *testing.T) {
+	m := testModel(t, board.Task{Title: "delegated"})
+	m.b.Set(m.rows[0].task.ID, "agent", "be-2175")
+	m.reload()
+
+	if got := m.worker(m.rows[0]); got != "" {
+		t.Errorf("annotated a claim before herdr had answered: %q", got)
+	}
+}
+
+// The heartbeat going quiet is the failure this project is organised around, so it is on
+// screen permanently rather than behind a command.
+func TestTheSummaryReportsAQuietHeartbeat(t *testing.T) {
+	m := testModel(t, board.Task{Title: "one"})
+
+	if got := m.summary(); !strings.Contains(got, "never run") {
+		t.Errorf("a heartbeat that has never run was not called out: %q", got)
+	}
+	m.beat = time.Now().Add(-8 * time.Hour)
+	if got := m.summary(); !strings.Contains(got, "heartbeat 8h ago") {
+		t.Errorf("a silent heartbeat was not reported: %q", got)
+	}
+	m.beat = time.Now().Add(-10 * time.Second)
+	if got := m.summary(); !strings.Contains(got, "just now") {
+		t.Errorf("a live heartbeat was not reported: %q", got)
+	}
+}
+
+// A list that silently ends at the fold is how you miss the task you came to find.
+func TestALongBoardScrollsAndSaysHowMuchIsHidden(t *testing.T) {
+	lines := make([]string, 40)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %d", i)
+	}
+	got := window(lines, 20, 10)
+
+	if len(got) != 10 {
+		t.Fatalf("windowed to %d lines, want 10", len(got))
+	}
+	if !strings.Contains(got[0], "more above") || !strings.Contains(got[len(got)-1], "more below") {
+		t.Errorf("did not say what it was hiding:\n%s", strings.Join(got, "\n"))
+	}
+	if !strings.Contains(strings.Join(got, "\n"), "row 20") {
+		t.Error("scrolled the cursor off its own screen")
+	}
+}
+
+// Timestamps are for humans here: the log stamps RFC3339, the screen wants a clock.
+func TestActivityLinesReadAsAClock(t *testing.T) {
+	stamped := "2026-08-21T21:35:08Z poked cone-lead (session \"be\") about 1 ready task(s)"
+	got := activityLine(stamped, 120)
+
+	if strings.Contains(got, "2026-08-21T") {
+		t.Errorf("printed a raw RFC3339 stamp: %q", got)
+	}
+	if !strings.Contains(got, "poked cone-lead") {
+		t.Errorf("lost the message: %q", got)
+	}
+	if plain := activityLine("no timestamp here", 120); !strings.Contains(plain, "no timestamp here") {
+		t.Errorf("dropped a line it could not parse: %q", plain)
 	}
 }
