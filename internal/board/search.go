@@ -23,11 +23,11 @@ import (
 //     any time, and deleting the database loses nothing. This is what preserves the property
 //     that an agent can participate with `mv` and `cat` alone.
 //
-//  2. THIS IS NOT A SECOND VAULT. Jeff's Obsidian vault is the knowledge system — curated,
-//     linked, with a weekly promotion ritual. cone indexes *operational history*: what was
-//     asked, what was claimed, what an agent reported. A durable learning gets promoted to
-//     the vault via the `journal` skill; it does not live here. Search the vault through the
-//     Obsidian MCP, not through this.
+//  2. THIS IS NOT A KNOWLEDGE BASE. cone indexes *operational history*: what was asked, what
+//     was claimed, what an agent reported. Whatever knowledge system its user already keeps is
+//     curated and linked and has a promotion ritual, and a durable learning belongs there. A
+//     board that grew a second one would be worse at both jobs and would compete with the real
+//     one for the same query.
 //
 // modernc.org/sqlite is used so CGO stays off and the binary stays a single static artifact.
 
