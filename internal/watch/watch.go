@@ -162,11 +162,21 @@ func (w *Watcher) Tick(ctx context.Context) {
 		w.hold("cannot read %s: %v", w.b.Root, err)
 		return
 	}
-	// Two directory reads, and on an empty board that is the whole tick: no subprocesses, no
+	blocked, err := w.b.List(board.Blocked)
+	if err != nil {
+		w.hold("cannot read %s: %v", w.b.Root, err)
+		return
+	}
+	// Held work is a task whose pane went away with output captured on it: it is waiting on a
+	// person, not on a worker. Filtering it here rather than counting all of blocked/ keeps a
+	// task parked on a human decision from costing a subprocess every tick for the rest of time.
+	held := heldForReview(blocked)
+
+	// Three directory reads, and on an empty board that is the whole tick: no subprocesses, no
 	// tokens, nothing. Work in flight counts as well as work waiting — this used to return
 	// here whenever ready/ was empty, which is the *normal* state at 2am while a worker is
 	// finishing, so the one moment harvesting exists for was the one it never ran in.
-	if len(ready) == 0 && len(doing) == 0 {
+	if len(ready) == 0 && len(doing) == 0 && len(held) == 0 {
 		w.clear()
 		return
 	}
@@ -196,20 +206,27 @@ func (w *Watcher) Tick(ctx context.Context) {
 		}
 	}
 
-	if len(ready) == 0 {
+	// Work that needs a lead and will never reach ready/: a worker that has finished, and a
+	// task held for review after its pane went away. The tick used to return here whenever
+	// ready/ was empty, so the system captured a finished worker's output and then told nobody
+	// it had — the task sat in doing/ until a human happened to open /tasks. Arrival was the
+	// only thing that could wake anyone, which is why work stalled one hop short of done.
+	review := reviewable(agents, doing, held)
+	if len(ready) == 0 && len(review) == 0 {
 		w.clear()
-		return // nothing waiting; the in-flight housekeeping above was the point of this tick
+		return // nothing to say; the in-flight housekeeping above was the point of this tick
 	}
 
 	inFlight := w.b.ActiveClaims(w.opt.HerdrBin)
-	if inFlight >= w.opt.MaxWorkers {
-		w.hold("%d claim(s) in flight, cap %d", inFlight, w.opt.MaxWorkers)
-		return
-	}
+	// The cap gates NEW work only. Reviewable work is how a claim gets closed and the cap comes
+	// back down, so staying silent about it at the cap is the one refusal that cannot clear
+	// itself: every slot full of finished-but-unlanded work and nobody told to land it.
+	atCap := inFlight >= w.opt.MaxWorkers
 
-	cands := idleOrchestrators(agents)
+	cands := availableOrchestrators(agents)
 	if len(cands) == 0 {
-		w.hold("%d task(s) ready, no idle orchestrator to take them", len(ready))
+		w.hold("%d task(s) ready, %d waiting on a lead, but no orchestrator is free to take them",
+			len(ready), len(review))
 		return
 	}
 
@@ -218,22 +235,27 @@ func (w *Watcher) Tick(ctx context.Context) {
 	// signature, so the real owner never hears about it.
 	for _, c := range cands {
 		mine := forRepo(ready, c.cwd)
-		if len(mine) == 0 {
+		if atCap {
+			mine = nil // at the cap there is nothing to start, but plenty to finish
+		}
+		theirs := forRepo(review, c.cwd)
+		if len(mine)+len(theirs) == 0 {
 			continue
 		}
-		sig := signature(mine)
+		sig := signature(append(append([]*board.Task{}, mine...), theirs...))
 		if w.poked[c.name] == sig {
 			continue // same set as last poke; nagging is how a heartbeat gets muted
 		}
 
 		msg := fmt.Sprintf(`%s
 
-(cone: %d task(s) ready, %d in flight, cap %d. Triage per %s/AGENTS.md.
+(cone: %s. Triage per %s/AGENTS.md.
 Claim only what you will actually start now — a claimed task nobody is working
-is worse than an unclaimed one.)`, w.opt.Prompt, len(mine), inFlight, w.opt.MaxWorkers, w.b.Root)
+is worse than an unclaimed one.)`, w.opt.Prompt, workLine(len(mine), len(theirs), inFlight, w.opt.MaxWorkers, atCap), w.b.Root)
 
 		if w.opt.DryRun {
-			fmt.Printf("would poke %s (session %q, cwd %s) about %d ready task(s)\n", c.name, c.session, c.cwd, len(mine))
+			fmt.Printf("would poke %s (session %q, cwd %s): %s\n", c.name, c.session, c.cwd,
+				workLine(len(mine), len(theirs), inFlight, w.opt.MaxWorkers, atCap))
 			return
 		}
 		if err := w.poke(ctx, c.session, c.name, msg); err != nil {
@@ -258,7 +280,66 @@ is worse than an unclaimed one.)`, w.opt.Prompt, len(mine), inFlight, w.opt.MaxW
 		w.say("poked %s (session %q) about %d ready task(s)", c.name, c.session, len(mine))
 		return
 	}
-	w.hold("%d task(s) ready, but no idle orchestrator is in a matching repo", len(ready))
+	if atCap {
+		w.hold("%d claim(s) in flight, cap %d, and nothing finished is waiting on a lead here",
+			inFlight, w.opt.MaxWorkers)
+		return
+	}
+	w.hold("%d task(s) ready, %d waiting on a lead, but no orchestrator is in a matching repo",
+		len(ready), len(review))
+}
+
+// workLine is the status line the woken lead reads. At the cap it deliberately leads with the
+// cap rather than with a ready count of zero: "0 task(s) ready" next to a full board is a lie
+// about why it was woken, and the thing it is being asked to do is land something, not start.
+func workLine(ready, review, inFlight, max int, atCap bool) string {
+	head := fmt.Sprintf("%d task(s) ready, %d in flight, cap %d", ready, inFlight, max)
+	if atCap {
+		head = fmt.Sprintf("%d claim(s) in flight, AT the cap of %d — landing one is what frees a slot",
+			inFlight, max)
+	}
+	if review > 0 {
+		head += fmt.Sprintf(", %d finished and waiting on you", review)
+	}
+	return head
+}
+
+// heldForReview is the blocked tasks carrying a captured snapshot: their worker's pane went
+// away and reap parked them here rather than re-queueing work that may already be done.
+func heldForReview(blocked []*board.Task) []*board.Task {
+	var out []*board.Task
+	for _, t := range blocked {
+		if board.HasWorkerOutput(t.Body) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// reviewable is work that is waiting on a person rather than on a worker.
+//
+// Two states qualify, and the system already knew about both while telling nobody: a claim
+// whose worker herdr reports finished — the pane is still there so nothing reaps it, and it
+// stays in doing/ until a lead lands it — and a task held for review after its pane went away.
+//
+// A task with no agent recorded cannot be judged this way, which is the practical reason to
+// close the triangle at delegation time: `cone set <id> agent <name>` is what lets the
+// heartbeat notice that this particular piece of work has finished.
+func reviewable(agents []board.Agent, doing, held []*board.Task) []*board.Task {
+	status := map[string]board.Agent{}
+	for _, a := range agents {
+		status[a.Name] = a
+	}
+	var out []*board.Task
+	for _, t := range doing {
+		if t.Agent == "" {
+			continue
+		}
+		if a, ok := status[t.Agent]; ok && a.Status == "done" {
+			out = append(out, t)
+		}
+	}
+	return append(out, held...)
 }
 
 // forRepo returns the tasks a lead in cwd could actually pick up: those with no repo set (any
@@ -352,15 +433,15 @@ func (w *Watcher) harvest(ctx context.Context, agents []board.Agent) {
 	}
 }
 
-// idleOrchestrators picks the agents sitting in a MAIN checkout. Workers live under a
+// availableOrchestrators picks the agents sitting in a MAIN checkout. Workers live under a
 // worktrees directory; anything else running an agent is a lead.
 //
 // Only "idle" counts. "done" was accepted here once and should not be: an agent that has
 // finished and exited still lists, and prompting it is a message into a dead pane.
-func idleOrchestrators(agents []board.Agent) []candidate {
+func availableOrchestrators(agents []board.Agent) []candidate {
 	var out []candidate
 	for _, a := range agents {
-		if !a.IsLead() || a.Status != "idle" {
+		if !a.IsLead() || !a.ReadyForInput() {
 			continue
 		}
 		out = append(out, candidate{session: a.Session, name: a.Name, cwd: a.CWD})
@@ -427,8 +508,13 @@ func (w *Watcher) poke(ctx context.Context, session, agent, msg string) error {
 		if a.Name != agent && a.PaneID != agent {
 			continue
 		}
-		if a.Status == "idle" {
-			return fmt.Errorf("still idle after the prompt — it did not take the turn")
+		// Still waiting for input means it never took the turn. This has to use the same
+		// definition as the picker: once `done` counts as reachable, a prompt into a pane whose
+		// session has ended comes back `done` too, and reading that as success would burn the
+		// signature on a message nobody received — the exact failure that made `done` ineligible
+		// in the first place. Detecting it here protects the invariant without hiding the lead.
+		if (board.Agent{Status: a.Status}).ReadyForInput() {
+			return fmt.Errorf("still waiting for input after the prompt — it did not take the turn")
 		}
 		return nil
 	}

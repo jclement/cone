@@ -227,7 +227,7 @@ func checkOrchestrators(herdrBin string) []Finding {
 			continue
 		}
 		leads = append(leads, fmt.Sprintf("%s (%s, %s)", a.Name, a.Status, a.CWD))
-		if a.Status == "idle" {
+		if a.ReadyForInput() {
 			idle = append(idle, a.Name)
 		}
 	}

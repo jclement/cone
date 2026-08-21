@@ -127,6 +127,23 @@ type Agent struct {
 // three different naming schemes; git knows which are linked and no pattern does.
 func (a Agent) IsLead() bool { return !isLinkedWorktree(a.CWD) }
 
+// ReadyForInput reports whether this agent could take a prompt right now.
+//
+// Herdr has two words for the same readiness. `idle` is an agent waiting with its tab seen;
+// `done` is that same agent when its tab has NOT been seen in the focused UI — and a CLI read
+// never marks a tab seen, only focusing does. Requiring `idle` therefore made a lead invisible
+// from the end of its first turn onward: it answered one poke, settled back to `done` unseen,
+// and was skipped from then on. Not just at bootstrap — every turn a lead completed unseen took
+// it out of the running again, permanently, and the symptom was a heartbeat holding with
+// "no idle orchestrator in a matching repo" while a perfectly reachable lead sat in that repo.
+//
+// harvest already reads `done` the other way, where it means "this worker has finished, take
+// its output". One status cannot mean finished for a worker and unreachable for a lead.
+//
+// `working` and `unknown` stay out: the first is mid-turn, and the second means herdr could not
+// classify it, which is not the same as ready.
+func (a Agent) ReadyForInput() bool { return a.Status == "idle" || a.Status == "done" }
+
 // isLinkedWorktree is true for a checkout whose git directory is not the repository's common
 // one — the definition of a linked worktree. A path that is not a repository at all is not a
 // worktree, so an agent parked in ~ or /tmp still counts as a lead.

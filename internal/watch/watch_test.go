@@ -256,17 +256,52 @@ func TestUnscopedTasksGoToAnyLead(t *testing.T) {
 	}
 }
 
-// "done" is not idle. A finished agent still lists for a while, and prompting it is a message
-// into a pane whose session has ended — accepted here once, which burnt the signature so the
-// real orchestrator never heard about that set.
-func TestAFinishedAgentIsNotTreatedAsIdle(t *testing.T) {
+// `done` used to be ineligible, and that made a lead unreachable from the end of its first
+// turn: herdr reports `done` for an agent that is waiting for input but whose tab has not been
+// SEEN in the focused UI, and a CLI read never marks a tab seen. So a lead answered one poke,
+// went back to `done` unseen, and the heartbeat skipped it forever while reporting that no idle
+// orchestrator was in a matching repo.
+func TestAnUnseenLeadIsStillReachable(t *testing.T) {
 	bin, dir := fakeHerdr(t, agents([3]string{"lead", "done", "/Users/x/Developer/be"}))
 	b := boardWith(t, board.Task{Title: "one thing"})
 
 	New(b, Options{HerdrBin: bin}).Tick(context.Background())
 
-	if strings.Contains(calls(t, dir), "agent prompt") {
-		t.Fatal("prompted an agent that had already finished")
+	if !strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("a lead waiting for input was never offered the work")
+	}
+}
+
+// The invariant the old `done` exclusion was really protecting, kept: `done` also covers an
+// agent whose session has ENDED but which still lists for a while. Prompting that is a message
+// into a dead pane, and recording the signature for it would mean the real orchestrator never
+// hears about that set. The prompt is bounded (`--until working`) and the confirmation re-reads
+// the status, so a pane that never takes the turn must not burn the signature.
+func TestAPokeIntoADeadPaneDoesNotBurnTheSignature(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	// Accepts the prompt and stays `done` forever: it never took the turn.
+	os.WriteFile(bin, []byte(`#!/bin/sh
+echo "$@" >> "`+dir+`/calls"
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\n' ;;
+  "agent list") printf '{"result":{"agents":[{"name":"lead","agent_status":"done","cwd":"/tmp/x"}]}}\n' ;;
+esac
+`), 0o755)
+	b := boardWith(t, board.Task{Title: "one thing"})
+	w := New(b, Options{HerdrBin: bin})
+
+	w.Tick(context.Background())
+	if w.poked["lead"] != "" {
+		t.Fatal("a prompt that was never taken up recorded its signature; the set is now lost")
+	}
+
+	// And it must not retry forever either — the bound still applies.
+	for i := 0; i < 6; i++ {
+		w.Tick(context.Background())
+	}
+	if w.poked["lead"] == "" {
+		t.Fatal("after the attempt bound it should record and move on")
 	}
 }
 
@@ -457,5 +492,93 @@ esac
 	got, _ := b.Find(task.ID)
 	if got.State != board.Ready {
 		t.Fatalf("state is %s, want ready — nothing was captured, so the work still needs doing", got.State)
+	}
+}
+
+// The gap that stopped work one hop short of done: the tick returned as soon as ready/ was
+// empty, so a worker could finish, have its output captured, and nobody was ever told. Arrival
+// was the only thing that could wake a lead — never completion.
+func TestAFinishedWorkerWakesTheLead(t *testing.T) {
+	bin, dir := fakeHerdr(t,
+		agents([3]string{"lead", "idle", "/Users/x/Developer/be"},
+			[3]string{"be-2175", "done", "/Users/x/.herdr/worktrees/be/feature-x"}))
+	b := boardWith(t)
+	claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	got := calls(t, dir)
+	if !strings.Contains(got, "agent prompt lead") {
+		t.Fatalf("a finished worker woke nobody; herdr saw:\n%s", got)
+	}
+	if !strings.Contains(got, "finished and waiting on you") {
+		t.Fatalf("the lead was woken without being told what is waiting:\n%s", got)
+	}
+}
+
+// A worker still working is not something to wake anyone about.
+func TestAWorkingWorkerWakesNobody(t *testing.T) {
+	bin, dir := fakeHerdr(t,
+		agents([3]string{"lead", "idle", "/Users/x/Developer/be"},
+			[3]string{"be-2175", "working", "/Users/x/.herdr/worktrees/be/feature-x"}))
+	b := boardWith(t)
+	claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	if strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("woke a lead about work that is still in progress")
+	}
+}
+
+// The cap gates NEW work only. Landing a finished claim is what frees a slot, so refusing to
+// mention finished work at the cap is the one refusal that can never clear itself: every slot
+// full of finished-but-unlanded work, and nobody told to land any of it.
+func TestTheWorkerCapDoesNotSilenceFinishedWork(t *testing.T) {
+	bin, dir := fakeHerdr(t,
+		agents([3]string{"lead", "idle", "/Users/x/Developer/be"},
+			[3]string{"be-2175", "done", "/Users/x/.herdr/worktrees/be/feature-x"}))
+	b := boardWith(t, board.Task{Title: "something new and ready"})
+	claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin, MaxWorkers: 1}).Tick(context.Background())
+
+	got := calls(t, dir)
+	if !strings.Contains(got, "agent prompt lead") {
+		t.Fatalf("at the cap with a finished worker, nobody was told to land it:\n%s", got)
+	}
+	if !strings.Contains(got, "AT the cap") {
+		t.Fatalf("the lead was not told why it was woken at the cap:\n%s", got)
+	}
+}
+
+// ...but the cap still does its job for work that has not started.
+func TestNewWorkIsStillWithheldAtTheCap(t *testing.T) {
+	bin, dir := fakeHerdr(t,
+		agents([3]string{"lead", "idle", "/Users/x/Developer/be"},
+			[3]string{"be-2175", "working", "/Users/x/.herdr/worktrees/be/feature-x"}))
+	b := boardWith(t, board.Task{Title: "something new and ready"})
+	claimedBy(t, b, "be-2175")
+
+	New(b, Options{HerdrBin: bin, MaxWorkers: 1}).Tick(context.Background())
+
+	if strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("started new work while at the worker cap")
+	}
+}
+
+// A task with no agent recorded cannot be judged finished — which is the practical cost of
+// delegating without `cone set <id> agent <name>`.
+func TestAClaimWithNoWorkerRecordedIsNotMistakenForFinished(t *testing.T) {
+	bin, dir := fakeHerdr(t, agents([3]string{"lead", "done", "/Users/x/Developer/be"}))
+	b := boardWith(t)
+	nt, _ := b.New(board.Task{Title: "claimed and never delegated"})
+	b.Promote(nt.ID)
+	b.Claim(nt.ID, "lead")
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	if strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("treated an unattributed claim as finished work")
 	}
 }
