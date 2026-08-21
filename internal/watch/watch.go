@@ -335,9 +335,20 @@ func reviewable(agents []board.Agent, doing, held []*board.Task) []*board.Task {
 		if t.Agent == "" {
 			continue
 		}
-		if a, ok := status[t.Agent]; ok && a.Status == "done" {
-			out = append(out, t)
+		a, ok := status[t.Agent]
+		if !ok || a.Status != "done" {
+			continue
 		}
+		// Only DELEGATED work counts. Claim stamps the herdr identity of whoever claimed, so a
+		// lead that takes a task on itself is recorded as its own agent — and a lead sits at
+		// `done` between the turns of work it is in the middle of. Reporting that back to it as
+		// "finished and waiting on you" would interrupt the very turn-by-turn work it describes.
+		// A lead's own abandoned claim is a real problem, but it is the one this cannot see;
+		// releasing before you stop is what covers it.
+		if a.IsLead() {
+			continue
+		}
+		out = append(out, t)
 	}
 	return append(out, held...)
 }

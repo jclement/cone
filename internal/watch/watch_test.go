@@ -582,3 +582,18 @@ func TestAClaimWithNoWorkerRecordedIsNotMistakenForFinished(t *testing.T) {
 		t.Fatal("treated an unattributed claim as finished work")
 	}
 }
+
+// Claim stamps the herdr identity of whoever claimed it, so a lead working a task inline is
+// recorded as its own agent — and a lead sits at `done` between the turns of that very work.
+// Reporting it back as "finished and waiting on you" interrupts the work it is describing.
+func TestALeadIsNotToldAboutItsOwnClaim(t *testing.T) {
+	bin, dir := fakeHerdr(t, agents([3]string{"lead", "done", "/Users/x/Developer/be"}))
+	b := boardWith(t)
+	claimedBy(t, b, "lead") // the lead is its own agent
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	if strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("woke a lead about the task it is itself in the middle of")
+	}
+}
