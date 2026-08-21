@@ -19,7 +19,8 @@ import (
 // exit code 0, and it had never once done its job: launchd's PATH does not include Homebrew,
 // so `herdr` did not resolve, and the failure was logged only under a flag the unit did not
 // pass. .watch.log was zero bytes for weeks and nobody looked, because nothing suggested
-// looking. "Loaded" is not "working", so this checks the paths and the log.
+// looking. "Loaded" is not "working", so this checks the paths and the log — and, since an
+// upgrade leaves the old process running, whether the code executing is the code installed.
 func Doctor(root string) []board.Finding {
 	var f []board.Finding
 
@@ -84,7 +85,90 @@ func Doctor(root string) []board.Finding {
 		}
 		f = append(f, board.Finding{Severity: sev, Area: "heartbeat", Message: msg})
 	}
+	if stale := staleWatcher(data, logPath); stale != nil {
+		f = append(f, *stale)
+	}
 	return f
+}
+
+// staleWatcher catches the heartbeat that is running code you have already replaced.
+//
+// launchd's KeepAlive respawns a process that DIES; it does not notice one whose binary changed
+// underneath it. So `brew upgrade cone` swaps the binary on disk and the running watcher goes on
+// executing whatever it was started with, for as long as the machine stays up. Seen for real:
+// a watcher two days old serving the version a fix had just been shipped to replace, logging the
+// symptom of that exact bug every interval while doctor called the board healthy.
+//
+// It is the same lesson a third time. "Loaded" is not "working", and now **running is not
+// current** — the one an upgrade silently creates, which makes it doctor's business.
+//
+// The process start time comes from the log rather than from ps: the watcher stamps a line when
+// it starts, that line is already there on every platform, and it needs no pid hunting and no
+// per-OS process table. No startup line means no comparison, and no comparison means say
+// nothing — a guess here would be worse than silence.
+func staleWatcher(unit, logPath string) *board.Finding {
+	exe := watcherBinary(unit)
+	if exe == "" {
+		return nil
+	}
+	bin, err := os.Stat(exe)
+	if err != nil {
+		return nil // the missing-path check above already reports this, and better
+	}
+	started, ok := lastStart(logPath)
+	if !ok || !bin.ModTime().After(started) {
+		return nil
+	}
+	return &board.Finding{
+		Severity: board.Broken, Area: "heartbeat",
+		Message: fmt.Sprintf(
+			"running since %s, but %s was replaced %s later — the heartbeat is still executing the version you upgraded from",
+			started.Format(time.RFC3339), exe, bin.ModTime().Sub(started).Round(time.Minute)),
+		Fix: restartHint(),
+	}
+}
+
+// watcherBinary is the program the unit runs. It is the first absolute path in the file by
+// construction: launchd's ProgramArguments and systemd's ExecStart both name the executable
+// before any of its arguments.
+func watcherBinary(unit string) string {
+	paths := pathsIn(unit)
+	if len(paths) == 0 {
+		return ""
+	}
+	return paths[0]
+}
+
+// lastStart is when the running watcher started, read from the line it stamps on startup.
+func lastStart(logPath string) (time.Time, bool) {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var out time.Time
+	var ok bool
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[1] != "watching" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, fields[0])
+		if err != nil {
+			continue
+		}
+		out, ok = t, true // the LAST one: the watcher may have been restarted since
+	}
+	return out, ok
+}
+
+func restartHint() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "launchctl kickstart -k gui/$(id -u)/" + label
+	case "linux":
+		return "systemctl --user restart cone"
+	}
+	return "restart the watcher"
 }
 
 type Finding = board.Finding
