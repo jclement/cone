@@ -112,6 +112,7 @@ func (b *Board) Set(id, key, value string) (*Task, error) {
 type Agent struct {
 	Session string
 	Name    string // the agent name, or its pane id when it has none
+	PaneID  string // herdr's identity for this agent: one pane hosts at most one
 	Status  string // idle | working | done | unknown
 	CWD     string
 }
@@ -160,7 +161,11 @@ func Agents(ctx context.Context, herdrBin string) ([]Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	// First session wins each pane. sessions() lists the default session first, and that is
+	// the socket serving the widest set, so the surviving row is the one most likely to be
+	// reachable when the heartbeat pokes it.
 	var out []Agent
+	seen := map[string]bool{}
 	for _, s := range sessions {
 		args := []string{}
 		if s != "" {
@@ -188,7 +193,21 @@ func Agents(ctx context.Context, herdrBin string) ([]Agent, error) {
 			if n == "" {
 				n = a.PaneID
 			}
-			out = append(out, Agent{Session: s, Name: n, Status: a.Status, CWD: a.CWD})
+			// Sessions overlap: herdr's default socket serves the agents of some named
+			// sessions too, so the same pane comes back from more than one `agent list` and
+			// doctor reported "14 lead(s)" for seven real ones. Keyed on the pane because
+			// that is the identity herdr itself uses and a pane hosts at most one agent —
+			// keyed on the name, two unnamed agents in one session would collapse into one,
+			// which is the direction that loses a live worker rather than merely repeating it.
+			key := a.PaneID
+			if key == "" {
+				key = s + "\x00" + n + "\x00" + a.CWD
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, Agent{Session: s, Name: n, PaneID: a.PaneID, Status: a.Status, CWD: a.CWD})
 		}
 	}
 	return out, nil

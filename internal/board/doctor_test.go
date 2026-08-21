@@ -1,6 +1,7 @@
 package board
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -197,5 +198,80 @@ func TestALinkedWorktreeIsNotALead(t *testing.T) {
 	}
 	if (Agent{CWD: ""}).IsLead() != true {
 		t.Error("an unknown cwd should not be assumed to be a worktree")
+	}
+}
+
+// fakeHerdrSessions writes a herdr that reports three running sessions where two of them —
+// default and "be" — serve the SAME agents, which is what this machine actually does. The
+// third has its own. `agent list` is answered per session: `herdr agent list` for default,
+// `herdr --session <name> agent list` for the rest.
+func fakeHerdrSessions(t *testing.T, shared, bob string) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  \"session list\") printf 'NAME STATUS\\ndefault running\\nbe running\\nbob running\\n' ;;\n" +
+		"  \"agent list\") printf '%s\\n' '" + shared + "' ;;\n" +
+		"  \"--session be agent list\") printf '%s\\n' '" + shared + "' ;;\n" +
+		"  \"--session bob agent list\") printf '%s\\n' '" + bob + "' ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// doctor reported "14 lead(s) visible to herdr" for seven real ones, because herdr's default
+// socket serves the agents of some named sessions too and Agents appended every session's
+// answer without asking whether it had seen that pane already.
+//
+// The unnamed lead is the case that matters and the case that regresses: `workspace create`
+// names nothing, so most leads arrive with an empty name and are labelled by pane id. Any
+// dedupe keyed on the name would either miss them or, worse, collapse two distinct unnamed
+// panes into one — losing a live lead, which is the failure the count was hiding in reverse.
+func TestAnAgentInTwoSessionsIsCountedOnce(t *testing.T) {
+	const shared = `{"result":{"agents":[` +
+		`{"name":"","pane_id":"w22:p1","agent_status":"idle","cwd":"/Users/jsc/Developer/timecop"},` +
+		`{"name":"","pane_id":"w16:p1","agent_status":"done","cwd":"/Users/jsc/Developer/herdrer"},` +
+		`{"name":"cone-lead","pane_id":"w28:p1","agent_status":"working","cwd":"/Users/jsc/Developer/cone"}` +
+		`]}}`
+	const bob = `{"result":{"agents":[` +
+		`{"name":"","pane_id":"w3:p2","agent_status":"idle","cwd":"/Users/jsc/Developer/bob"}` +
+		`]}}`
+
+	agents, err := Agents(context.Background(), fakeHerdrSessions(t, shared, bob))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]int{}
+	for _, a := range agents {
+		seen[a.PaneID]++
+	}
+	want := map[string]int{"w22:p1": 1, "w16:p1": 1, "w28:p1": 1, "w3:p2": 1}
+	for pane, n := range want {
+		if seen[pane] != n {
+			t.Errorf("pane %s appears %d time(s), want %d", pane, seen[pane], n)
+		}
+	}
+	if len(agents) != len(want) {
+		t.Fatalf("got %d agents, want %d: %+v", len(agents), len(want), agents)
+	}
+
+	// The unnamed ones still carry a usable label, since that is what the poke addresses.
+	for _, a := range agents {
+		if a.Name == "" {
+			t.Errorf("pane %s has no name to address it by", a.PaneID)
+		}
+	}
+
+	// And the symptom the bug was reported as: the number a human reads under pressure.
+	msg := strings.Join(findings(checkOrchestrators(fakeHerdrSessions(t, shared, bob)), OK), " ")
+	if !strings.Contains(msg, "4 lead(s)") {
+		t.Errorf("doctor said %q, want 4 lead(s)", msg)
+	}
+	if strings.Count(msg, "w22:p1") != 1 {
+		t.Errorf("doctor listed w22:p1 %d times: %q", strings.Count(msg, "w22:p1"), msg)
 	}
 }
