@@ -213,6 +213,60 @@ func reorder(fs *flag.FlagSet, args []string) []string {
 	return append(append(flags, "--"), rest...)
 }
 
+// newUsage is what `cone new --help` prints. Answering that guess matters more here than in a
+// normal CLI: reorder deliberately treats an unknown dash word as title text, so until this
+// existed `cone new --help` filed a task actually titled "help", silently. The board is the
+// coordination layer — every agent on this machine files, most are guessing at the flags the
+// first time, and one that accumulates "help" tasks is one people stop trusting.
+const newUsage = `usage: cone new [flags] <title>
+
+  File a task into inbox. The title is free text and the flags may sit on either side of it.
+  Use -- when the title itself has to begin with a dash.
+
+`
+
+// helpOrUnknownFlag inspects the leading-dash arguments of a board-writing command before
+// reorder folds the unrecognised ones into the title: it reports a request for help, or the
+// first argument that is neither a known flag nor deliberate text.
+//
+// It walks args exactly as reorder does — same known/bool lookup, same "the word after a
+// non-bool flag is its value" step — because a gate that disagreed with the parser would
+// reject arguments the parser was about to accept. Everything after -- is title text and is
+// not inspected, which is what keeps a title legitimately able to begin with a dash.
+//
+// Only `new` uses this. The permissiveness is right for the commands that merely read or
+// annotate ("-1 was the culprit" is a finding, not a flag); it is wrong for the one command
+// whose mistyped argument becomes a new row on the board.
+func helpOrUnknownFlag(fs *flag.FlagSet, args []string) (help bool, err error) {
+	known, isBool := map[string]bool{}, map[string]bool{}
+	fs.VisitAll(func(f *flag.Flag) {
+		known[f.Name] = true
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			isBool[f.Name] = true
+		}
+	})
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return false, nil
+		}
+		if !strings.HasPrefix(a, "-") || len(a) < 2 {
+			continue
+		}
+		name, _, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		switch {
+		case name == "h" || name == "help":
+			return true, nil
+		case !known[name]:
+			return false, fmt.Errorf("unknown flag %q — see cone new --help, or put it after -- to make it part of the title", a)
+		case !hasValue && !isBool[name] && i+1 < len(args):
+			i++
+		}
+	}
+	return false, nil
+}
+
 func runTUI() error {
 	upd := selfupdate.Start(version)
 	b, err := open()
@@ -243,6 +297,15 @@ func cmdNew(args []string) error {
 	prio := fs.String("priority", "normal", "low|normal|high")
 	auto := fs.Bool("auto", false, "pre-authorise starting without asking")
 	ready := fs.Bool("ready", false, "skip triage and file straight into ready")
+	switch help, err := helpOrUnknownFlag(fs, args); {
+	case err != nil:
+		return err
+	case help:
+		fs.SetOutput(os.Stdout)
+		fmt.Print(newUsage)
+		fs.PrintDefaults()
+		return nil
+	}
 	fs.Parse(reorder(fs, args))
 	if fs.NArg() == 0 {
 		return errors.New("usage: cone new [flags] <title>")
