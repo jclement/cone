@@ -109,11 +109,40 @@ that has one, has one because somebody decided what done means. If it is missing
 is worth one question before starting, not a guess afterwards.
 
 ` + "`repo:`" + ` decides who gets woken about it: the heartbeat only offers a task to a lead sitting in
-a matching checkout. A task with no repo is offered to anyone, which is right for "look into X"
-and wrong for anything that will touch code — set it.
+a matching checkout. A ready task with no repo is offered to anyone, which is right for "look
+into X" and wrong for anything that will touch code. An **untriaged** task with no repo is
+offered to nobody at all — there is no way to choose a lead for it — so it waits for a human.
+Set it.
 
 **The frontmatter schema is closed.** A key you add by hand is dropped by the next write. Use
 ` + "`cone set <id> <worktree|agent|branch|repo|priority> <value>`" + `; everything else belongs in the body.
+
+## Filing: the jobs you are not doing right now
+
+**Before you stop, everything you were asked to do and have not done goes on the board.** This
+is the single most common way work is lost here — not a crash, not a race: an agent is given
+four things, does one, reports on it, and the other three exist nowhere but a conversation that
+is about to be compacted. A subagent's answer is not the end of the work either; it is one of
+the four.
+
+    cone new "<what and why>" -repo <repo> -ready      # file it AND make it claimable
+    cone new "<what and why>" -repo <repo> -ready -auto  # ...and pre-authorise starting it
+
+- **` + "`-ready`" + ` when you want it acted on.** Without it a task lands in ` + "`inbox/`" + `, which means
+  "filed, not yet triaged" — a lead is offered it for triage, not for work. Use plain
+  ` + "`cone new`" + ` when you genuinely want a human to decide whether it is worth doing.
+- **` + "`-repo`" + ` always.** It is how the heartbeat knows which lead to offer it to. An untriaged
+  task with no repo cannot be routed to anybody and will sit until a human finds it.
+- **` + "`-auto`" + ` only when the work is safe to start unattended.** It pre-authorises claiming,
+  nothing more — every gate you already work under still applies. The agent filing the task is
+  the one that knows whether that particular piece of work needs a human first; that judgement
+  cannot be made by a config file.
+- **Say what and why, not just what.** The next agent gets the title and the body and nothing
+  else. "Fix the export" is not a task; "CSV export drops the last row when the page size
+  divides evenly — seen on 2026-08-21, probably the off-by-one in paginate()" is.
+
+Filing is cheap and losing work is not. If you are weighing whether something is worth a task,
+it is.
 
 ## Turning a task into work
 

@@ -57,6 +57,17 @@ type Options struct {
 	Verbose    bool
 	DryRun     bool
 	NoReap     bool // leave claims held by dead agents alone
+
+	// Reraise is how long to wait before mentioning the SAME outstanding work to the same lead
+	// again. Zero means the default. An agent that is told once and stops is the common way
+	// work dies here, so silence after one telling is not a virtue — but neither is a poke
+	// every interval, which is how a heartbeat gets ignored.
+	Reraise time.Duration
+
+	// StaleClaim is how long a claim may sit untouched before its holder is nudged about it.
+	// A lead that claimed something and moved on looks identical to one mid-way through it;
+	// only time separates them, and the reaper cannot help because the claimant is alive.
+	StaleClaim time.Duration
 }
 
 func (o *Options) defaults() {
@@ -68,6 +79,12 @@ func (o *Options) defaults() {
 	}
 	if o.Prompt == "" {
 		o.Prompt = "/tasks"
+	}
+	if o.Reraise <= 0 {
+		o.Reraise = 10 * time.Minute
+	}
+	if o.StaleClaim <= 0 {
+		o.StaleClaim = time.Hour
 	}
 	// A bare name is resolved once, here, so the failure is reported at startup with a fix in
 	// it rather than as a bare ENOENT on every tick for the life of the process.
@@ -86,10 +103,14 @@ type Watcher struct {
 	opt Options
 	log func(string, ...any)
 
-	// poked remembers, per orchestrator, the signature of the task set it was last woken
-	// about. Keyed by agent so two orchestrators are not treated as one, and persisted so a
-	// KeepAlive restart does not re-poke about a set someone is already triaging.
-	poked map[string]string
+	// poked remembers, per orchestrator, the task set it was last woken about — with when, and
+	// how many times. Keyed by agent so two orchestrators are not treated as one, and persisted
+	// so a KeepAlive restart does not re-poke about a set someone is already triaging.
+	//
+	// The count is what makes persistence bounded rather than permanent. Telling a lead once
+	// and never again assumes it acted; the common failure is that it answered, did part of the
+	// work, and stopped, after which nothing in the system would ever mention the rest again.
+	poked map[string]pokeRecord
 
 	complaint string // the last thing that stopped a poke
 	since     time.Time
@@ -101,11 +122,23 @@ type Watcher struct {
 	tries map[string]int
 }
 
+// pokeRecord is what was said to one lead, when, and how many times without the work moving.
+type pokeRecord struct {
+	Sig   string    `json:"sig"`
+	At    time.Time `json:"at"`
+	Count int       `json:"count"`
+}
+
 const maxPokeAttempts = 3
+
+// maxRaises bounds how often the same unchanged work is raised with the same lead. Persistence
+// past this is not persistence, it is noise: if a lead has been told four times over the better
+// part of an hour and the work has not moved, the problem is not that it has not heard.
+const maxRaises = 4
 
 func New(b *board.Board, opt Options) *Watcher {
 	opt.defaults()
-	w := &Watcher{b: b, opt: opt, poked: map[string]string{}, tries: map[string]int{}, log: func(string, ...any) {}}
+	w := &Watcher{b: b, opt: opt, poked: map[string]pokeRecord{}, tries: map[string]int{}, log: func(string, ...any) {}}
 	if opt.Verbose {
 		w.log = w.say
 	}
@@ -172,11 +205,21 @@ func (w *Watcher) Tick(ctx context.Context) {
 	// task parked on a human decision from costing a subprocess every tick for the rest of time.
 	held := heldForReview(blocked)
 
-	// Three directory reads, and on an empty board that is the whole tick: no subprocesses, no
+	// Untriaged work was a black hole: inbox/ is where `cone new` files by default and where
+	// `cone sync` lands a queue, and nothing read it. Every task filed by an agent that did not
+	// know to pass -ready went there and was never offered to anyone, so a board could hold a
+	// week of real work and look idle. It has to be counted HERE, before the cheap exit below,
+	// or a board whose only work is untriaged still returns as though it were empty.
+	untriaged, err := w.b.List(board.Inbox)
+	if err != nil {
+		untriaged = nil
+	}
+
+	// Four directory reads, and on an empty board that is the whole tick: no subprocesses, no
 	// tokens, nothing. Work in flight counts as well as work waiting — this used to return
 	// here whenever ready/ was empty, which is the *normal* state at 2am while a worker is
 	// finishing, so the one moment harvesting exists for was the one it never ran in.
-	if len(ready) == 0 && len(doing) == 0 && len(held) == 0 {
+	if len(ready) == 0 && len(doing) == 0 && len(held) == 0 && len(untriaged) == 0 {
 		w.clear()
 		return
 	}
@@ -212,7 +255,16 @@ func (w *Watcher) Tick(ctx context.Context) {
 	// it had — the task sat in doing/ until a human happened to open /tasks. Arrival was the
 	// only thing that could wake anyone, which is why work stalled one hop short of done.
 	review := reviewable(agents, doing, held)
-	if len(ready) == 0 && len(review) == 0 {
+
+	// A claim older than the threshold is not work in progress; it is work that stopped. The
+	// reaper cannot help, because it only rescues claims whose worker herdr has FORGOTTEN, and
+	// this claimant is alive and simply moved on. Nothing else in the system says anything.
+	stale, err := w.b.Stale(w.opt.StaleClaim)
+	if err != nil {
+		stale = nil
+	}
+
+	if len(ready) == 0 && len(review) == 0 && len(untriaged) == 0 && len(stale) == 0 {
 		w.clear()
 		return // nothing to say; the in-flight housekeeping above was the point of this tick
 	}
@@ -225,8 +277,8 @@ func (w *Watcher) Tick(ctx context.Context) {
 
 	cands := availableOrchestrators(agents)
 	if len(cands) == 0 {
-		w.hold("%d task(s) ready, %d waiting on a lead, but no orchestrator is free to take them",
-			len(ready), len(review))
+		w.hold("%d task(s) ready, %d waiting on a lead, %d untriaged, but no orchestrator is free to take them",
+			len(ready), len(review), len(untriaged))
 		return
 	}
 
@@ -239,23 +291,36 @@ func (w *Watcher) Tick(ctx context.Context) {
 			mine = nil // at the cap there is nothing to start, but plenty to finish
 		}
 		theirs := forRepo(review, c.cwd)
-		if len(mine)+len(theirs) == 0 {
+		triage := scopedTo(untriaged, c.cwd)
+		stalled := stalledFor(stale, c)
+		all := concat(mine, theirs, triage, stalled)
+		if len(all) == 0 {
 			continue
 		}
-		sig := signature(append(append([]*board.Task{}, mine...), theirs...))
-		if w.poked[c.name] == sig {
-			continue // same set as last poke; nagging is how a heartbeat gets muted
+		sig := signature(all)
+
+		// Told about this exact set already. Raise it again only after a cooldown, and only a
+		// bounded number of times: an agent that answers one poke, does part of the work and
+		// stops is the ordinary way work dies here, and one telling assumes it acted.
+		rec := w.poked[c.name]
+		if rec.Sig == sig {
+			if rec.Count >= maxRaises {
+				continue // said enough; see the give-up notice below
+			}
+			if time.Since(rec.At) < w.opt.Reraise {
+				continue // still inside the cooldown; nagging is how a heartbeat gets muted
+			}
 		}
 
 		msg := fmt.Sprintf(`%s
 
 (cone: %s. Triage per %s/AGENTS.md.
 Claim only what you will actually start now — a claimed task nobody is working
-is worse than an unclaimed one.)`, w.opt.Prompt, workLine(len(mine), len(theirs), inFlight, w.opt.MaxWorkers, atCap), w.b.Root)
+is worse than an unclaimed one.)`, w.opt.Prompt, workLine(len(mine), len(theirs), len(triage), len(stalled), inFlight, w.opt.MaxWorkers, atCap), w.b.Root)
 
 		if w.opt.DryRun {
 			fmt.Printf("would poke %s (session %q, cwd %s): %s\n", c.name, c.session, c.cwd,
-				workLine(len(mine), len(theirs), inFlight, w.opt.MaxWorkers, atCap))
+				workLine(len(mine), len(theirs), len(triage), len(stalled), inFlight, w.opt.MaxWorkers, atCap))
 			return
 		}
 		if err := w.poke(ctx, c.session, c.name, msg); err != nil {
@@ -273,11 +338,28 @@ is worse than an unclaimed one.)`, w.opt.Prompt, workLine(len(mine), len(theirs)
 		}
 		// Only now: a signature recorded for a prompt that never arrived means this exact
 		// set is never mentioned again, which is the worst possible failure for a queue.
-		w.poked[c.name] = sig
+		raised := 1
+		if rec.Sig == sig {
+			raised = rec.Count + 1
+		}
+		w.poked[c.name] = pokeRecord{Sig: sig, At: time.Now().UTC(), Count: raised}
 		delete(w.tries, c.name+"\x00"+sig)
 		w.saveState()
 		w.clear()
-		w.say("poked %s (session %q) about %d ready task(s)", c.name, c.session, len(mine))
+		if raised == 1 {
+			w.say("poked %s (session %q): %s", c.name, c.session,
+				workLine(len(mine), len(theirs), len(triage), len(stalled), inFlight, w.opt.MaxWorkers, atCap))
+		} else {
+			w.say("raised the same work with %s again (%d of %d): %s", c.name, raised, maxRaises,
+				workLine(len(mine), len(theirs), len(triage), len(stalled), inFlight, w.opt.MaxWorkers, atCap))
+		}
+		if raised == maxRaises {
+			// Loud, once, and unconditional. Everything else here is designed so that silence
+			// means nothing to do; a lead that has been told this many times and has not moved
+			// the work is the one case where silence would mean the opposite.
+			w.say("%s has now been told %d times about the same work and it has not moved — nothing further will be said about this set",
+				c.name, maxRaises)
+		}
 		return
 	}
 	if atCap {
@@ -285,14 +367,14 @@ is worse than an unclaimed one.)`, w.opt.Prompt, workLine(len(mine), len(theirs)
 			inFlight, w.opt.MaxWorkers)
 		return
 	}
-	w.hold("%d task(s) ready, %d waiting on a lead, but no orchestrator is in a matching repo",
-		len(ready), len(review))
+	w.hold("%d task(s) ready, %d waiting on a lead, %d untriaged, but nothing is outstanding for a lead in a matching repo",
+		len(ready), len(review), len(untriaged))
 }
 
 // workLine is the status line the woken lead reads. At the cap it deliberately leads with the
 // cap rather than with a ready count of zero: "0 task(s) ready" next to a full board is a lie
 // about why it was woken, and the thing it is being asked to do is land something, not start.
-func workLine(ready, review, inFlight, max int, atCap bool) string {
+func workLine(ready, review, triage, stalled, inFlight, max int, atCap bool) string {
 	head := fmt.Sprintf("%d task(s) ready, %d in flight, cap %d", ready, inFlight, max)
 	if atCap {
 		head = fmt.Sprintf("%d claim(s) in flight, AT the cap of %d — landing one is what frees a slot",
@@ -301,7 +383,54 @@ func workLine(ready, review, inFlight, max int, atCap bool) string {
 	if review > 0 {
 		head += fmt.Sprintf(", %d finished and waiting on you", review)
 	}
+	if stalled > 0 {
+		head += fmt.Sprintf(", %d claimed by you and not moving", stalled)
+	}
+	if triage > 0 {
+		head += fmt.Sprintf(", %d untriaged", triage)
+	}
 	return head
+}
+
+// scopedTo is forRepo's stricter sibling: it requires an actual repo match rather than also
+// accepting the unscoped. Untriaged work is offered this way because an inbox task with no
+// repo cannot be routed — offering it to whichever lead the loop reaches first is how two
+// agents end up doing the same job. Those are reported by `cone doctor` instead.
+func scopedTo(tasks []*board.Task, cwd string) []*board.Task {
+	var out []*board.Task
+	for _, t := range tasks {
+		if t.Repo != "" && matchesRepo(t.Repo, cwd) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// stalledFor is the claims this lead should be nudged about: the ones it holds itself, and the
+// unattributed ones in its repo.
+//
+// A claim with no agent recorded cannot be attributed to anybody, and it is the worst case
+// rather than an exempt one — nothing will ever reap it, so it holds a worker slot forever. It
+// goes to whichever lead owns the repo, because somebody has to hear about it.
+func stalledFor(stale []*board.Task, c candidate) []*board.Task {
+	var out []*board.Task
+	for _, t := range stale {
+		switch {
+		case t.Agent != "" && t.Agent == c.name:
+			out = append(out, t)
+		case t.Agent == "" && t.Repo != "" && matchesRepo(t.Repo, c.cwd):
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func concat(lists ...[]*board.Task) []*board.Task {
+	var out []*board.Task
+	for _, l := range lists {
+		out = append(out, l...)
+	}
+	return out
 }
 
 // heldForReview is the blocked tasks carrying a captured snapshot: their worker's pane went
@@ -542,9 +671,22 @@ func (w *Watcher) loadState() {
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(data, &w.poked)
+	if json.Unmarshal(data, &w.poked) != nil {
+		// Written by a version that stored a bare signature per lead. Carry it over rather than
+		// discarding it: a dropped memory means one gratuitous re-poke about a set somebody may
+		// already be working, on every machine, at upgrade.
+		var old map[string]string
+		if json.Unmarshal(data, &old) != nil {
+			w.poked = nil
+		} else {
+			w.poked = map[string]pokeRecord{}
+			for name, sig := range old {
+				w.poked[name] = pokeRecord{Sig: sig, At: time.Now().UTC(), Count: 1}
+			}
+		}
+	}
 	if w.poked == nil {
-		w.poked = map[string]string{}
+		w.poked = map[string]pokeRecord{}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jclement/cone/internal/board"
 )
@@ -292,7 +293,7 @@ esac
 	w := New(b, Options{HerdrBin: bin})
 
 	w.Tick(context.Background())
-	if w.poked["lead"] != "" {
+	if w.poked["lead"].Sig != "" {
 		t.Fatal("a prompt that was never taken up recorded its signature; the set is now lost")
 	}
 
@@ -300,7 +301,7 @@ esac
 	for i := 0; i < 6; i++ {
 		w.Tick(context.Background())
 	}
-	if w.poked["lead"] == "" {
+	if w.poked["lead"].Sig == "" {
 		t.Fatal("after the attempt bound it should record and move on")
 	}
 }
@@ -595,5 +596,166 @@ func TestALeadIsNotToldAboutItsOwnClaim(t *testing.T) {
 
 	if strings.Contains(calls(t, dir), "agent prompt") {
 		t.Fatal("woke a lead about the task it is itself in the middle of")
+	}
+}
+
+// fakeHerdrRecovering models what a real lead does: it takes the turn when prompted — so the
+// poke confirms — and is waiting for input again by the next tick. The plain fake leaves the
+// agent "working" forever, which no live agent does and which hides everything that happens
+// after the first poke.
+func fakeHerdrRecovering(t *testing.T, cwd string) (bin, dir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake")
+	}
+	dir = t.TempDir()
+	bin = filepath.Join(dir, "herdr")
+	script := `#!/bin/sh
+echo "$@" >> "` + dir + `/calls"
+status=done
+if [ -f "` + dir + `/turn" ]; then status=working; rm -f "` + dir + `/turn"; fi
+case "$1 $2" in
+  "session list") printf 'NAME STATUS\ndefault running\n' ;;
+  "agent list") printf '{"result":{"agents":[{"name":"lead","pane_id":"w1:p1","agent_status":"%s","cwd":"` + cwd + `"}]}}\n' "$status" ;;
+  "agent prompt") touch "` + dir + `/turn" ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, dir
+}
+
+// Told once, then silence, on the assumption the lead acted. The ordinary way work dies here is
+// that it answered, did part of it, and stopped — after which nothing would ever mention the
+// rest again.
+func TestOutstandingWorkIsRaisedAgain(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b := boardWith(t, board.Task{Title: "still not done"})
+	w := New(b, Options{HerdrBin: bin, Reraise: time.Millisecond})
+
+	w.Tick(context.Background())
+	if n := strings.Count(calls(t, dir), "agent prompt"); n != 1 {
+		t.Fatalf("first tick sent %d prompts, want 1", n)
+	}
+	time.Sleep(2 * time.Millisecond)
+	w.Tick(context.Background())
+
+	if n := strings.Count(calls(t, dir), "agent prompt"); n != 2 {
+		t.Fatalf("work still sitting there was never mentioned again (%d prompts)", n)
+	}
+}
+
+// ...but persistence has to be bounded. A lead told this many times about work that has not
+// moved has not failed to hear.
+func TestRaisingTheSameWorkStopsEventually(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b := boardWith(t, board.Task{Title: "ignored"})
+	w := New(b, Options{HerdrBin: bin, Reraise: time.Millisecond, Verbose: true})
+
+	for i := 0; i < maxRaises+3; i++ {
+		time.Sleep(2 * time.Millisecond)
+		w.Tick(context.Background())
+	}
+
+	if n := strings.Count(calls(t, dir), "agent prompt"); n != maxRaises {
+		t.Fatalf("sent %d prompts about unchanged work, want the bound of %d", n, maxRaises)
+	}
+}
+
+// Within the cooldown it stays quiet: a poke every interval is how a heartbeat gets ignored.
+func TestTheSameWorkIsNotRaisedInsideTheCooldown(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b := boardWith(t, board.Task{Title: "just mentioned"})
+	w := New(b, Options{HerdrBin: bin, Reraise: time.Hour})
+
+	w.Tick(context.Background())
+	w.Tick(context.Background())
+	w.Tick(context.Background())
+
+	if n := strings.Count(calls(t, dir), "agent prompt"); n != 1 {
+		t.Fatalf("nagged %d times inside the cooldown, want 1", n)
+	}
+}
+
+// inbox/ is where `cone new` files by default and where `cone sync` lands a queue, and nothing
+// read it. A board could hold a week of real work and look idle.
+func TestUntriagedWorkReachesTheLeadThatOwnsIt(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b, err := board.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.New(board.Task{Title: "filed and never triaged", Repo: "be"}); err != nil {
+		t.Fatal(err)
+	}
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	got := calls(t, dir)
+	if !strings.Contains(got, "agent prompt lead") {
+		t.Fatalf("an untriaged task reached nobody:\n%s", got)
+	}
+	if !strings.Contains(got, "untriaged") {
+		t.Errorf("the lead was not told what kind of work was waiting:\n%s", got)
+	}
+}
+
+// An inbox task with no repo cannot be routed. Offering it to whichever lead the loop reaches
+// first is how two agents end up doing the same job; doctor reports these instead.
+func TestUnroutableUntriagedWorkWakesNobody(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b, err := board.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.New(board.Task{Title: "no repo on this one"})
+
+	New(b, Options{HerdrBin: bin}).Tick(context.Background())
+
+	if strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("offered an unroutable task to a lead that may not own it")
+	}
+}
+
+// A claim that has not moved is not work in progress. The reaper cannot help — it only rescues
+// claims whose worker herdr has forgotten, and this claimant is alive and has moved on.
+func TestALeadIsNudgedAboutItsOwnStalledClaim(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b, err := board.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _ := b.New(board.Task{Title: "claimed then forgotten", Repo: "be"})
+	b.Promote(task.ID)
+	b.Claim(task.ID, "lead")
+	b.Set(task.ID, "agent", "lead")
+
+	New(b, Options{HerdrBin: bin, StaleClaim: time.Nanosecond}).Tick(context.Background())
+
+	got := calls(t, dir)
+	if !strings.Contains(got, "agent prompt lead") {
+		t.Fatalf("a claim that stopped moving was never raised with the lead holding it:\n%s", got)
+	}
+	if !strings.Contains(got, "not moving") {
+		t.Errorf("the lead was not told why it was woken:\n%s", got)
+	}
+}
+
+// A claim being actively worked must not be nudged — a lead sits between turns of its own work.
+func TestAFreshClaimIsLeftAlone(t *testing.T) {
+	bin, dir := fakeHerdrRecovering(t, "/Users/x/Developer/be")
+	b, err := board.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _ := b.New(board.Task{Title: "in progress right now", Repo: "be"})
+	b.Promote(task.ID)
+	b.Claim(task.ID, "lead")
+	b.Set(task.ID, "agent", "lead")
+
+	New(b, Options{HerdrBin: bin, StaleClaim: time.Hour}).Tick(context.Background())
+
+	if strings.Contains(calls(t, dir), "agent prompt") {
+		t.Fatal("interrupted a lead about the task it is in the middle of")
 	}
 }

@@ -54,8 +54,37 @@ func (b *Board) Doctor(herdrBin string) []Finding {
 	out = append(out, b.checkStates()...)
 	out = append(out, b.checkClaims(herdrBin)...)
 	out = append(out, b.checkIndex()...)
+	out = append(out, b.checkUntriaged()...)
 	out = append(out, checkOrchestrators(herdrBin)...)
 	return out
+}
+
+// checkUntriaged reports the inbox tasks that no lead will ever be offered.
+//
+// The heartbeat routes by repo, so an inbox task WITH one reaches the lead sitting in that
+// checkout and gets triaged. One without cannot be routed at all — offering it to whichever
+// lead came first is how two agents end up doing the same job — so it sits there, and until
+// this check existed nothing said so. A board can hold a week of real work and read as idle,
+// which is the failure this whole command exists to catch.
+func (b *Board) checkUntriaged() []Finding {
+	inbox, err := b.List(Inbox)
+	if err != nil || len(inbox) == 0 {
+		return nil
+	}
+	var orphans []string
+	for _, t := range inbox {
+		if t.Repo == "" {
+			orphans = append(orphans, t.ID)
+		}
+	}
+	if len(orphans) == 0 {
+		return []Finding{{OK, "inbox",
+			fmt.Sprintf("%d untriaged, all routable — the lead in each repo will be offered them", len(inbox)), ""}}
+	}
+	return []Finding{{Warn, "inbox",
+		fmt.Sprintf("%d of %d untriaged task(s) have no repo, so nothing can offer them to anyone: %s",
+			len(orphans), len(inbox), strings.Join(orphans, ", ")),
+		"cone set <id> repo <name> — then the heartbeat can route it"}}
 }
 
 // checkFiles reads every file on disk directly rather than through List, which is the whole
