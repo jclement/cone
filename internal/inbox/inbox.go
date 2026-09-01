@@ -154,10 +154,7 @@ type Config struct {
 	Name      string `json:"name"`
 	URL       string `json:"url"`
 	ClaimPath string `json:"claim_path"`
-	Token     string `json:"token"`
-	TokenEnv  string `json:"token_env"`
-	TokenFile string `json:"token_file"`
-	TokenKey  string `json:"token_key"`
+	TokenSource
 }
 
 // ConfigPath is where sources are declared. $CONE_INBOXES overrides it.
@@ -200,7 +197,7 @@ func Configured() ([]Source, error) {
 		if c.ClaimPath == "" {
 			return nil, fmt.Errorf("%s: inbox %q needs a claim_path", ConfigPath(), c.Name)
 		}
-		token, err := c.token()
+		token, err := c.Resolve()
 		if err != nil {
 			return nil, fmt.Errorf("inbox %q: %w", c.Name, err)
 		}
@@ -214,52 +211,29 @@ func Configured() ([]Source, error) {
 	return out, nil
 }
 
-func (c Config) token() (string, error) {
-	if c.Token != "" {
-		return c.Token, nil
-	}
-	if c.TokenEnv != "" {
-		return os.Getenv(c.TokenEnv), nil
-	}
-	if c.TokenFile == "" {
-		return "", nil
-	}
-	path := c.TokenFile
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		path = filepath.Join(home, path[2:])
-	}
-	data, err := os.ReadFile(path)
+// SyncConfigured is the whole `cone sync` operation behind one call: read the config, pull
+// every source, file what is new, refresh the index. Both the CLI and the watch tick run this,
+// so the two cannot drift. No config file means (nil, nil, nil) — most hosts sync nothing, and
+// that must cost nothing.
+func SyncConfigured(ctx context.Context, b *board.Board) (filed []*board.Task, names []string, err error) {
+	sources, err := Configured()
 	if err != nil {
-		return "", err
+		return nil, nil, err
 	}
-	// A KEY=VALUE file, which is what every service's enrollment writes. Without a token_key
-	// the first value wins, so a single-line file needs no extra configuration.
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		k, v, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		v = strings.Trim(strings.TrimSpace(v), `"'`)
-		if c.TokenKey == "" || strings.TrimSpace(k) == c.TokenKey {
-			return v, nil
-		}
+	if len(sources) == 0 {
+		return nil, nil, nil
 	}
-	return "", fmt.Errorf("%s has no %s", path, orDefault(c.TokenKey, "usable KEY=VALUE line"))
-}
+	for _, s := range sources {
+		names = append(names, s.Name())
+	}
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 
-func orDefault(s, d string) string {
-	if s == "" {
-		return d
+	filed, err = Sync(ctx, b, sources)
+	if len(filed) > 0 {
+		_, _ = b.Reindex()
 	}
-	return s
+	return filed, names, err
 }
 
 type HTTPSource struct {
