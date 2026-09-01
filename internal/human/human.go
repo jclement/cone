@@ -237,16 +237,14 @@ func (s *Service) Ask(ctx context.Context, q Question) (*Asked, error) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("%s returned %s: %s", s.Name, resp.Status, snippet(resp.Body))
 	}
-	var env struct {
-		Data Asked `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+	var asked Asked
+	if err := decodeEnvelope(resp.Body, &asked); err != nil {
 		return nil, err
 	}
-	if env.Data.ID == "" {
+	if asked.ID == "" {
 		return nil, fmt.Errorf("%s accepted the question but returned no id", s.Name)
 	}
-	return &env.Data, nil
+	return &asked, nil
 }
 
 // maxWait is the contract's long-poll ceiling.
@@ -279,13 +277,33 @@ func (s *Service) Question(ctx context.Context, id string, wait time.Duration) (
 		return nil, fmt.Errorf("%s returned %s: %s", s.Name, resp.Status, snippet(resp.Body))
 	}
 	var a Answer
-	if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
+	if err := decodeEnvelope(resp.Body, &a); err != nil {
 		return nil, err
 	}
 	if a.Status == "" {
 		return nil, fmt.Errorf("%s returned no status for question %s", s.Name, id)
 	}
 	return &a, nil
+}
+
+// decodeEnvelope unmarshals a response body into v, unwrapping a {"data": …} envelope when one
+// is present and taking the body bare otherwise. Tolerance is the point: the contract stays
+// service-agnostic, so whether a service wraps its responses — meatprompt wraps every one, and
+// its GET was seen live returning {"data": {"status": …}} where the written contract showed the
+// bare object — must not be cone's problem. Safe because neither Asked nor Answer has a field
+// named "data" of its own.
+func decodeEnvelope(r io.Reader, v any) error {
+	var raw json.RawMessage
+	if err := json.NewDecoder(r).Decode(&raw); err != nil {
+		return err
+	}
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err == nil && len(env.Data) > 0 && string(env.Data) != "null" {
+		raw = env.Data
+	}
+	return json.Unmarshal(raw, v)
 }
 
 func snippet(r io.Reader) string {

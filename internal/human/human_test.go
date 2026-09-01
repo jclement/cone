@@ -96,6 +96,41 @@ func TestQuestionSubstitutesTheIDAndLongPolls(t *testing.T) {
 	}
 }
 
+// Seen live: the written contract showed the question GET returning a bare {"status": …}, but
+// the real service wraps every response in a {"data": …} envelope — and the sweep read that as
+// "no status", so answered tasks sat in blocked/ forever. Both shapes must decode, because
+// which one a service uses is not cone's business.
+func TestQuestionAcceptsAnEnvelopedResponse(t *testing.T) {
+	for _, c := range []struct {
+		name, body   string
+		status, note string
+	}{
+		{"enveloped answered", `{"data":{"status":"answered","answer_value":"yes","answer_note":"carefully"}}`, StatusAnswered, "carefully"},
+		{"enveloped expired", `{"data":{"status":"expired"}}`, StatusExpired, ""},
+		{"bare still works", `{"status":"answered","answer_value":"yes","answer_note":"carefully"}`, StatusAnswered, "carefully"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(c.body))
+			}))
+			defer srv.Close()
+			configure(t, srv, "")
+
+			svc, err := Configured()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ans, err := svc.Question(context.Background(), "q_1", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ans.Status != c.status || ans.Note != c.note {
+				t.Fatalf("decoded %+v from %s", ans, c.body)
+			}
+		})
+	}
+}
+
 // Most hosts have no human service, and that must cost nothing and say nothing.
 func TestNoConfigFileMeansNoServiceNotAnError(t *testing.T) {
 	t.Setenv("CONE_HUMAN", filepath.Join(t.TempDir(), "absent.json"))
