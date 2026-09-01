@@ -75,13 +75,13 @@ func tools() []tool {
 				"kind":     str("investigate|implement|review|chore (default investigate)"),
 				"priority": str("low|normal|high"),
 			}, "title")},
-		{"cone_update", "Change a task's state or record what you found. `done` on an investigation REQUIRES result — a finding nobody wrote down is the failure this board exists to prevent, and a ruled-out cause counts. `note` records a finding without changing state, so an hour-one discovery does not wait for hour six to become findable. `back` releases your claim: use it the moment you stop working on something, not when you remember. `set` writes agent/worktree/branch/kind. `block` files it away and notifies nobody — ask the human separately.",
+		{"cone_update", "Change a task's state or record what you found. `done` on an investigation REQUIRES result — a finding nobody wrote down is the failure this board exists to prevent, and a ruled-out cause counts. `note` records a finding without changing state, so an hour-one discovery does not wait for hour six to become findable. `back` releases your claim: use it the moment you stop working on something, not when you remember. `set` writes agent/worktree/branch/kind. `block` files it away and notifies nobody — `cone ask` (shell) posts the actual question, and the heartbeat delivers the answer.",
 			obj(map[string]any{
 				"id":     str("task id"),
 				"action": str("ready|done|block|back|note|set"),
 				"result": str("what you found — required to finish an investigation"),
 				"note":   str("why, for block; the finding, for note"),
-				"key":    str("for set: worktree|agent|branch|repo|priority|kind"),
+				"key":    str("for set: worktree|agent|branch|repo|priority|kind|question"),
 				"value":  str("for set: the value"),
 			}, "id", "action")},
 		{"cone_search", "Full-text search across every task and board message. Run this BEFORE starting work to find whether someone already investigated the same thing — repeated work is the most common multi-agent failure.",
@@ -272,7 +272,7 @@ func (s *server) call(name string, a map[string]any) (string, error) {
 			msg = fmt.Sprintf("%s updated (still %s)", t.ID, t.State)
 		}
 		if action == "block" {
-			msg += "\nNote: blocked/ is a filing cabinet, not a notification — post the actual question to the ask-the-human service."
+			msg += "\nNote: blocked/ is a filing cabinet, not a notification — `cone ask <id> …` (shell) posts the actual question, and the heartbeat delivers the answer."
 		}
 		return msg, nil
 

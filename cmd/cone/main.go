@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jclement/cone/internal/board"
+	"github.com/jclement/cone/internal/human"
 	"github.com/jclement/cone/internal/inbox"
 	"github.com/jclement/cone/internal/install"
 	"github.com/jclement/cone/internal/mcpsrv"
@@ -47,8 +48,9 @@ TASKS
   cone done <id> [--result …] doing -> done. An investigation needs a result
   cone block <id> [why]       doing -> blocked
   cone back <id>              release a claim, back to ready
+  cone ask <id> [flags]       post a question to the human service and block on the answer
   cone note <id> <text>       record a finding without changing state
-  cone set <id> <key> <val>   worktree | agent | branch | repo | priority | kind
+  cone set <id> <key> <val>   worktree | agent | branch | repo | priority | kind | question
   cone stale [-h hours]       claims older than N hours (reports only)
   cone reap [--dry-run]       release claims held by agents herdr has lost
 
@@ -125,6 +127,8 @@ func run(args []string) error {
 		return cmdBlock(rest)
 	case "back", "release":
 		return cmdTransition(rest, "back")
+	case "ask":
+		return cmdAsk(rest)
 	case "note":
 		return cmdNote(rest)
 	case "set":
@@ -532,7 +536,7 @@ func cmdNote(args []string) error {
 // abandoned checkout is distinguishable from debris.
 func cmdSet(args []string) error {
 	if len(args) < 3 {
-		return errors.New("usage: cone set <id> <worktree|agent|branch|repo|priority|kind> <value>")
+		return errors.New("usage: cone set <id> <worktree|agent|branch|repo|priority|kind|question> <value>")
 	}
 	b, err := open()
 	if err != nil {
@@ -590,8 +594,197 @@ func cmdBlock(args []string) error {
 	}
 	fmt.Println(t.Path)
 	fmt.Fprintln(os.Stderr, "note: blocked/ is a filing cabinet, not a notification — "+
-		"post the actual question through the ask-the-human service")
+		"`cone ask` posts the actual question, and the heartbeat delivers the answer")
 	return nil
+}
+
+// askUsage is what `cone ask --help` prints. The phone-answerable rules live here and in the
+// board's AGENTS.md — guidance for the asker, deliberately not enforced in code.
+const askUsage = `usage: cone ask <task-id> --title <t> (--body <md> | --body-file <path>) [flags]
+
+  Post a question about a task to the configured human service, record the question id on the
+  task, and move the task to blocked/. From there the heartbeat owns the answer: when the human
+  answers, the task returns to ready/ with the answer noted verbatim, and the next lead is
+  offered it. --wait blocks here until the question settles instead.
+
+  The human answers from a phone and sees only the title, the body and the options. So: paste
+  the verbatim diff or error, not a description of it; give every option its consequence, not
+  just a label; say which option you recommend (--recommend, required for confirm and choice)
+  and put the strongest argument against it in the body. Most questions are not questions —
+  anything inferable from the ticket, the code, or the conventions, you decide.
+
+  The service is declared in ~/.config/cone/human.json ($CONE_HUMAN overrides); no file means
+  no human service on this host.
+
+`
+
+// optionList collects repeated --option flags, each KEY:LABEL[:DETAIL].
+type optionList []human.Option
+
+func (o *optionList) String() string {
+	parts := make([]string, len(*o))
+	for i, opt := range *o {
+		parts[i] = opt.Key
+	}
+	return strings.Join(parts, ",")
+}
+
+func (o *optionList) Set(v string) error {
+	parts := strings.SplitN(v, ":", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("an option is KEY:LABEL or KEY:LABEL:DETAIL (got %q)", v)
+	}
+	opt := human.Option{Key: parts[0], Label: parts[1]}
+	if len(parts) == 3 {
+		opt.Detail = parts[2]
+	}
+	*o = append(*o, opt)
+	return nil
+}
+
+// cmdAsk is the one verb an agent blocked on a human needs. Durability first: the question id
+// lands on the task before anything else is reported, so even a crashed --wait leaves a task
+// the heartbeat's sweep can finish the job on.
+func cmdAsk(args []string) error {
+	fs := flag.NewFlagSet("ask", flag.ExitOnError)
+	title := fs.String("title", "", "one line the human sees first (required)")
+	bodyFlag := fs.String("body", "", "the question, markdown")
+	bodyFile := fs.String("body-file", "", "read the body from a file, or - for stdin")
+	kind := fs.String("kind", human.KindManual, "confirm|choice|ack|manual (confirm and choice require --recommend)")
+	var options optionList
+	fs.Var(&options, "option", "KEY:LABEL[:DETAIL], repeatable — the choices offered")
+	recommend := fs.String("recommend", "", "the option key you would pick")
+	urgency := fs.String("urgency", "normal", "low|normal|blocking")
+	expires := fs.Int("expires-hours", 0, "let the question expire after this many hours")
+	wait := fs.Bool("wait", false, "block until the question settles instead of leaving it to the heartbeat")
+	fs.Usage = func() {
+		fmt.Print(askUsage)
+		fs.SetOutput(os.Stdout)
+		fs.PrintDefaults()
+	}
+	fs.Parse(reorder(fs, args))
+	if fs.NArg() == 0 {
+		return errors.New("usage: cone ask <task-id> --title <t> (--body <md> | --body-file <path>)  (--help for the rest)")
+	}
+
+	body := *bodyFlag
+	if *bodyFile != "" {
+		var data []byte
+		var err error
+		if *bodyFile == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(*bodyFile)
+		}
+		if err != nil {
+			return err
+		}
+		body = string(data)
+	}
+
+	b, err := open()
+	if err != nil {
+		return err
+	}
+	t, err := b.Find(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	svc, err := human.Configured()
+	if err != nil {
+		return err
+	}
+	if svc == nil {
+		return fmt.Errorf("no human service on this host — declare one in %s (name, url, and a token source; see the README's \"The human loop\")", human.ConfigPath())
+	}
+
+	// context is what lets the human's phone show where the question came from, and what lets
+	// anything downstream find its way back to the board.
+	qctx := map[string]string{"task": t.ID, "board": b.Root}
+	if t.Agent != "" {
+		qctx["agent"] = t.Agent
+	}
+	if t.Repo != "" {
+		qctx["repo"] = t.Repo
+	}
+	if t.Worktree != "" {
+		qctx["worktree"] = t.Worktree
+	}
+	q := human.Question{
+		Title: *title, BodyMD: body, Kind: *kind, Options: options,
+		Recommend: *recommend, Context: qctx, Urgency: *urgency, ExpiresInHours: *expires,
+	}
+	ctx := context.Background()
+	asked, err := svc.Ask(ctx, q)
+	if err != nil {
+		return err
+	}
+
+	// The question exists remotely from here on, so every failure below must still name it.
+	if _, err := b.Set(t.ID, "question", asked.ID); err != nil {
+		return fmt.Errorf("question %s was posted (%s) but could not be recorded: %w — run: cone set %s question %s",
+			asked.ID, asked.URL, err, t.ID, asked.ID)
+	}
+	if _, err := b.Note(t.ID, "Asked", fmt.Sprintf("%q posted to %s — %s", q.Title, svc.Name, asked.URL)); err != nil {
+		return fmt.Errorf("question %s is recorded but its note failed: %w", asked.ID, err)
+	}
+	if t.State != board.Blocked {
+		if _, err := b.Block(t.ID, ""); err != nil {
+			return fmt.Errorf("question %s is recorded but the task could not be blocked: %w", asked.ID, err)
+		}
+	}
+	fmt.Printf("%s %s\n", asked.ID, asked.URL)
+	if !*wait {
+		fmt.Fprintln(os.Stderr, "the heartbeat owns the answer from here — the task returns to ready/ when the human answers")
+		return nil
+	}
+	return awaitAnswer(ctx, b, svc, t.ID, asked.ID)
+}
+
+// awaitAnswer long-polls until the question settles. Interrupting it loses nothing: the task
+// is blocked with its question recorded, and the watch sweep produces the same end state.
+func awaitAnswer(ctx context.Context, b *board.Board, svc *human.Service, taskID, questionID string) error {
+	fmt.Fprintln(os.Stderr, "waiting — ctrl-c is safe; the heartbeat will deliver the answer instead")
+	failures := 0
+	for {
+		ans, err := svc.Question(ctx, questionID, 90*time.Second)
+		if err != nil {
+			failures++
+			if failures >= 5 {
+				return fmt.Errorf("cannot reach %s (%v) — giving up on waiting; the task stays blocked and the heartbeat will deliver the answer", svc.Name, err)
+			}
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		failures = 0
+		switch ans.Status {
+		case human.StatusOpen:
+			// A conforming server held the request for the full wait; one that answered
+			// immediately would otherwise make this a tight loop.
+			time.Sleep(2 * time.Second)
+		case human.StatusAnswered:
+			t, err := human.Answered(b, taskID, questionID, ans)
+			if err != nil {
+				return fmt.Errorf("answered, but the answer could not be applied: %w", err)
+			}
+			if ans.Value != "" {
+				fmt.Println(ans.Value)
+			}
+			if ans.Note != "" {
+				fmt.Println(ans.Note)
+			}
+			fmt.Fprintf(os.Stderr, "answer noted on %s\n", t.Path)
+			return nil
+		default:
+			// Expired or cancelled. Loudly noted, and the task deliberately STAYS blocked:
+			// the asker is right here to be told, and must not read silence as consent. The
+			// watch sweep will re-offer it for triage on its next pass.
+			if _, err := b.Note(taskID, "No answer", human.UnansweredNote(questionID, ans.Status)); err != nil {
+				return fmt.Errorf("question %s %s, and noting that failed: %w", questionID, ans.Status, err)
+			}
+			return fmt.Errorf("question %s %s without an answer — expiry is not consent; the task stays blocked", questionID, ans.Status)
+		}
+	}
 }
 
 func cmdStale(args []string) error {
@@ -725,6 +918,7 @@ func cmdDoctor(args []string) error {
 	fmt.Printf("board: %s\n\n", b.Root)
 
 	findings := append(b.Doctor(*herdrBin), install.Doctor(b.Root)...)
+	findings = append(findings, human.Doctor(b)...)
 	worst := board.OK
 	area := ""
 	for _, f := range findings {
@@ -772,35 +966,21 @@ func cmdSync() error {
 	if err != nil {
 		return err
 	}
-	sources, err := inbox.Configured()
-	if err != nil {
+	filed, names, err := inbox.SyncConfigured(context.Background(), b)
+	if err != nil && len(names) == 0 {
 		return err
 	}
-	if len(sources) == 0 {
+	if len(names) == 0 {
 		fmt.Printf("no inboxes configured (declare them in %s)\n", inbox.ConfigPath())
 		return nil
 	}
-	names := make([]string, len(sources))
-	for i, s := range sources {
-		names[i] = s.Name()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	filed, err := inbox.Sync(ctx, b, sources)
 	for _, t := range filed {
 		fmt.Printf("filed  %s  (from %s)\n", t.ID, t.Source)
 	}
 	if len(filed) == 0 && err == nil {
 		fmt.Printf("nothing new from %s\n", strings.Join(names, ", "))
 	}
-	if err != nil {
-		return err
-	}
-	if len(filed) > 0 {
-		_, _ = b.Reindex()
-	}
-	return nil
+	return err
 }
 
 func cmdWatch(args []string) error {
