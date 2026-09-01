@@ -42,6 +42,8 @@ import (
 	"time"
 
 	"github.com/jclement/cone/internal/board"
+	"github.com/jclement/cone/internal/human"
+	"github.com/jclement/cone/internal/inbox"
 )
 
 // renagInterval is how long a stable complaint stays quiet before it is repeated. Long enough
@@ -185,6 +187,15 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 // Tick runs one cycle. Exported so `cone watch --once` and tests can drive it directly.
 func (w *Watcher) Tick(ctx context.Context) {
+	// The two remote pulls run first, so a task queued from a phone or an answer that arrived
+	// overnight is on the board before this tick counts the work — offered now, not next tick.
+	// Both are failure-isolated: an unreachable service is logged and retried next tick, and
+	// must never stop the heartbeat. Skipped under --dry-run because both mutate the board.
+	if !w.opt.DryRun {
+		w.syncInboxes(ctx)
+		w.sweepQuestions(ctx)
+	}
+
 	ready, err := w.b.List(board.Ready)
 	if err != nil {
 		w.hold("cannot read %s: %v", w.b.Root, err)
@@ -527,6 +538,72 @@ func signature(tasks []*board.Task) string {
 }
 
 type candidate struct{ session, name, cwd string }
+
+// syncInboxes pulls configured inboxes onto the board, so a task queued from a phone arrives
+// without anyone having to run `cone sync`. A host with no inboxes.json pays one file stat.
+func (w *Watcher) syncInboxes(ctx context.Context) {
+	filed, _, err := inbox.SyncConfigured(ctx, w.b)
+	for _, t := range filed {
+		w.say("filed %s (from %s)", t.ID, t.Source)
+	}
+	if err != nil {
+		w.log("inbox sync: %v", err)
+	}
+}
+
+// sweepQuestions closes the human loop. Every blocked task carrying a question id gets its
+// question checked (no wait); an answered one comes back to ready with the answer noted, where
+// the ordinary wake machinery offers it like any ready task — that is the point: no new poke
+// path. Expired and cancelled come back too, loudly, because a lead must re-triage with eyes
+// open — expiry is not consent. Once a task moves it leaves this set naturally; there is no
+// ack round-trip and no per-question state outside the board.
+func (w *Watcher) sweepQuestions(ctx context.Context) {
+	blocked, err := w.b.List(board.Blocked)
+	if err != nil {
+		return
+	}
+	var waiting []*board.Task
+	for _, t := range blocked {
+		// Applied questions are skipped: the question key is kept for history, so a task
+		// blocked again later for an unrelated reason must not have its old answer redelivered.
+		if t.Question != "" && !human.Applied(t) {
+			waiting = append(waiting, t)
+		}
+	}
+	if len(waiting) == 0 {
+		return
+	}
+	svc, err := human.Configured()
+	if err != nil {
+		w.log("human service: %v", err)
+		return
+	}
+	if svc == nil {
+		w.log("%d blocked task(s) carry a question but no human service is configured", len(waiting))
+		return
+	}
+	for _, t := range waiting {
+		ans, err := svc.Question(ctx, t.Question, 0)
+		if err != nil {
+			w.log("question %s (task %s): %v", t.Question, t.ID, err)
+			continue
+		}
+		switch ans.Status {
+		case human.StatusAnswered:
+			if _, err := human.Answered(w.b, t.ID, t.Question, ans); err != nil {
+				w.log("could not apply the answer to %s: %v", t.ID, err)
+				continue
+			}
+			w.say("question %s answered — %s is ready again", t.Question, t.ID)
+		case human.StatusExpired, human.StatusCancelled:
+			if _, err := human.Unanswered(w.b, t.ID, t.Question, ans.Status); err != nil {
+				w.log("could not record the %s question on %s: %v", ans.Status, t.ID, err)
+				continue
+			}
+			w.say("question %s %s unanswered — %s is back in ready for re-triage", t.Question, ans.Status, t.ID)
+		}
+	}
+}
 
 // harvest captures a worker's recent terminal output onto the task it is working.
 //
