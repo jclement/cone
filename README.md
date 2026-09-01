@@ -100,7 +100,8 @@ cone                               # the TUI
 | `cone claim <id>` | ready → doing. **Atomic**: exactly one agent wins |
 | `cone done <id> [--result …]` | finish it. An **investigation must record what it found** |
 | `cone note <id> <text>` | record a finding without changing state |
-| `cone set <id> <key> <value>` | `worktree` · `agent` · `branch` · `repo` · `priority` |
+| `cone set <id> <key> <value>` | `worktree` · `agent` · `branch` · `repo` · `priority` · `kind` · `question` |
+| `cone ask <id> --title … --body …` | post a question to the human service; the heartbeat delivers the answer |
 | `cone block <id>` · `back` | the rest of the lifecycle |
 | `cone reap [--dry-run]` | release claims held by agents herdr has lost |
 | `cone stale [-h 8]` | claims older than N hours (reports only) |
@@ -143,6 +144,53 @@ because silently syncing nothing is indistinguishable from an empty queue.
 Deduplication is by upstream id across **every** state, so re-running never double-files. These
 endpoints hand a task to exactly one caller, so a fetch is destructive: anything that cannot
 then be filed lands in `inbox-quarantine/` rather than disappearing, and `cone doctor` says so.
+
+The heartbeat runs the same sync every tick, so a task queued from a phone reaches the board —
+and a lead — with nobody at a keyboard.
+
+## The human loop
+
+An inbox is a human handing work *to* the agents; this is the other direction. An agent hits a
+judgement call it genuinely cannot make — two defensible designs, an irreversible action — and
+the human is not at the terminal:
+
+```sh
+cone ask 20260901-migrate-the-index \
+     --title "Drop the FTS index during migration?" --body-file question.md \
+     --kind choice --option drop:"Drop and rebuild":"~40s of no search" \
+     --option keep:"Migrate in place":"slower, but search stays up" \
+     --recommend drop
+```
+
+One command: the question goes to the human's phone with full context (task id, board, repo,
+worktree), the question id lands on the task's frontmatter, and the task moves to `blocked/`.
+From there **the heartbeat owns the answer**: every tick it checks blocked questions, and an
+answered one returns to `ready/` with the answer noted verbatim — where the ordinary wake
+machinery offers it to a lead like any other work. The asking agent does not need to survive to
+receive the answer; `--wait` blocks in place for agents that would rather have it now, and
+converges on exactly the same end state.
+
+An expired or cancelled question comes back too, loudly noted: **expiry is not consent** — the
+task returns for re-triage, never as authorisation to proceed.
+
+**cone knows about no particular service here either.** The contract is one POST and one GET,
+declared in `~/.config/cone/human.json`:
+
+```json
+{
+  "name":       "meatprompt",
+  "url":        "https://example.com",
+  "token_file": "~/.config/meatprompt/env",
+  "token_key":  "MEATPROMPT_TOKEN"
+}
+```
+
+`ask_path` (default `/api/v1/questions`) and `question_path` (default `/api/v1/questions/{id}`)
+override the endpoints; token semantics are identical to an inbox entry. POSTing the question
+returns `{"data": {"id", "url", "expires_at"}}`; GETting it returns
+`{"status": "open|answered|expired|cancelled", "answer_value", "answer_note"}`, with `?wait=N`
+long-polling up to 90s. No file means no human service on this host, and every feature degrades
+to a clear message rather than an error loop.
 
 ## MCP
 
@@ -209,6 +257,7 @@ broken, so it can be scripted.
 | `CONE_HOME` | `~/cone` | board root |
 | `CONE_AGENT` | `$HERDR_AGENT`, else hostname | who claims |
 | `CONE_INBOXES` | `~/.config/cone/inboxes.json` | where sources are declared |
+| `CONE_HUMAN` | `~/.config/cone/human.json` | the human-in-the-loop service |
 | `CONE_HERDR` | `herdr` on `PATH` | which herdr the heartbeat wakes |
 | `CONE_NO_UPDATE_CHECK` | — | set to anything to silence the update check |
 

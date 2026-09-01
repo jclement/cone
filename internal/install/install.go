@@ -92,9 +92,24 @@ that closes with nothing but a timestamp makes the next agent redo the work — 
 ` + "`kind: investigate`" + ` task without a result is refused, deliberately. Write the finding even if it
 is "no, the cache is not the problem": a ruled-out cause is a result.
 
-Stuck on something only a human can resolve: ` + "`cone block <id> \"what you need\"`" + ` **and** post the
-actual question through the ask-the-human service — ` + "`blocked/`" + ` is a filing cabinet, not a
-notification.
+Blocked on a human? **` + "`cone ask`" + ` — one command:**
+
+    cone ask <id> --title "…" --body "…" [--kind choice --option k:label --recommend k]
+
+It posts the question to this machine's human-in-the-loop service, records the question id on
+the task, and parks the task in ` + "`blocked/`" + `. **The heartbeat delivers the answer**: when the human
+answers, the task returns to ` + "`ready/`" + ` with the answer noted verbatim, and a lead is offered it
+like any other work — you do not need to survive to receive it. Two rules that matter more than
+the mechanism:
+
+- **Most questions are not questions.** Anything inferable from the task, the code, or your
+  conventions, you decide. A default you could pick and flag beats blocking; make the question
+  answerable from a phone (the verbatim diff, options with their consequences, your
+  recommendation and the strongest argument against it).
+- **Expiry is not consent.** A question that expires or is cancelled unanswered comes back for
+  re-triage, not as authorisation. Nothing was approved.
+
+` + "`cone block <id> \"why\"`" + ` alone is a filing cabinet, not a notification — nothing pings anyone.
 
 ## The task file
 
@@ -115,7 +130,8 @@ offered to nobody at all — there is no way to choose a lead for it — so it w
 Set it.
 
 **The frontmatter schema is closed.** A key you add by hand is dropped by the next write. Use
-` + "`cone set <id> <worktree|agent|branch|repo|priority> <value>`" + `; everything else belongs in the body.
+` + "`cone set <id> <worktree|agent|branch|repo|priority|kind|question> <value>`" + `; everything else
+belongs in the body.
 
 ## Filing: the jobs you are not doing right now
 
@@ -189,7 +205,9 @@ act differently after reading it, do not post it.
 ` + "`cone watch`" + ` runs from the platform scheduler. It checks in shell — free — whether ` + "`ready/`" + ` is
 non-empty, a lead is idle in a matching repo, and we are under the worker cap. Only then does it
 wake anyone. Idle costs nothing, and it will not nag: it hashes the ready set per lead and does
-not re-poke about an unchanged one.
+not re-poke about an unchanged one. Each tick also pulls any configured inboxes and checks every
+blocked task's outstanding question, so work queued from a phone and answers from a human both
+land on the board with nobody running a command.
 
 Claims held by agents Herdr no longer knows about are released automatically (` + "`cone reap`" + ` does it
 by hand). Without that, a few crashed workers hold every slot and the heartbeat goes quiet
