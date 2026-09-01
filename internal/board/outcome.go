@@ -97,8 +97,12 @@ func (b *Board) Set(id, key, value string) (*Task, error) {
 		// refuses to close one without a result. Without this the only ways out were to
 		// invent a result (poisoning the one thing done/ is for) or abandon the task.
 		t.Kind = value
+	case "question":
+		// The human service's id for the question this task waits on. `cone ask` writes it;
+		// the watch sweep is what reads it, so a task asked about by hand still comes back.
+		t.Question = value
 	default:
-		return nil, fmt.Errorf("cannot set %q (worktree|agent|branch|repo|priority|kind). "+
+		return nil, fmt.Errorf("cannot set %q (worktree|agent|branch|repo|priority|kind|question). "+
 			"Other fields are not round-tripped and would be lost on the next write", key)
 	}
 	if err := b.Save(t); err != nil {

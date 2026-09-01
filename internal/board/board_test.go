@@ -97,6 +97,53 @@ func TestRoundTripPreservesBodyAndAwkwardTitle(t *testing.T) {
 	}
 }
 
+// `question` is part of the closed frontmatter schema: it has to survive a write-read cycle
+// and be writable through Set, or `cone ask` records an id the next mutation silently drops —
+// and with it the only pointer the answer sweep has.
+func TestQuestionIsPartOfTheClosedSchema(t *testing.T) {
+	b := tmpBoard(t)
+	task, err := b.New(Task{Title: "needs a human"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Set(task.ID, "question", "q_abc123"); err != nil {
+		t.Fatal(err)
+	}
+	// A later, unrelated mutation must round-trip it.
+	if _, err := b.Note(task.ID, "Note", "something learned meanwhile"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.Find(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Question != "q_abc123" {
+		t.Fatalf("question did not survive the round trip: %q", got.Question)
+	}
+	// And a task with no question must not carry an empty key.
+	bare, _ := b.New(Task{Title: "ordinary work"})
+	if strings.Contains(bare.Marshal(), "question:") {
+		t.Fatalf("an empty question key is written:\n%s", bare.Marshal())
+	}
+}
+
+// "Should we even triage this?" is a legitimate question about an untriaged task, so `cone ask`
+// must be able to park an inbox task in blocked/ — and the answer arriving promotes it.
+func TestAnInboxTaskCanBeBlockedOnAQuestion(t *testing.T) {
+	b := tmpBoard(t)
+	task, _ := b.New(Task{Title: "is this worth doing"})
+	if _, err := b.Block(task.ID, "asked the human whether to triage it"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := b.Find(task.ID)
+	if got.State != Blocked {
+		t.Fatalf("state = %s, want blocked", got.State)
+	}
+	if _, err := b.Release(task.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLifecycleTransitions(t *testing.T) {
 	b := tmpBoard(t)
 	task, _ := b.New(Task{Title: "walk the states"})

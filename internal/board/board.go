@@ -72,6 +72,7 @@ type Task struct {
 	Worktree  string    `yaml:"worktree"`
 	Agent     string    `yaml:"agent"`
 	Branch    string    `yaml:"branch"`
+	Question  string    `yaml:"question"` // the human service's id for the question this waits on
 	Completed time.Time `yaml:"completed"`
 
 	Body  string `yaml:"-"`
@@ -406,8 +407,11 @@ func (b *Board) Block(id, why string) (*Task, error) {
 	// Ready is allowed as well as Doing. A lead that reads a task and sees immediately that
 	// it needs a human decision should be able to say so without first claiming it — and
 	// `/tasks` offers exactly that, so requiring the claim made the documented flow an error.
-	if t.State != Doing && t.State != Ready {
-		return nil, fmt.Errorf("only a ready or claimed task can be blocked; %s is %s", id, t.State)
+	// Inbox is allowed for the same reason one step earlier: "should we even triage this?" is
+	// a legitimate question to ask about an untriaged task, and `cone ask` parks the task in
+	// blocked/ while the human decides. The answer arriving is what promotes it.
+	if t.State != Doing && t.State != Ready && t.State != Inbox {
+		return nil, fmt.Errorf("only an inbox, ready or claimed task can be blocked; %s is %s", id, t.State)
 	}
 	if why != "" {
 		t.Body = strings.TrimRight(t.Body, "\n") +

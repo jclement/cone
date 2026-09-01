@@ -71,6 +71,8 @@ func Unmarshal(raw string) (*Task, error) {
 			t.Agent = unquote(v)
 		case "branch":
 			t.Branch = unquote(v)
+		case "question":
+			t.Question = unquote(v)
 		case "completed":
 			t.Completed = parseTime(v)
 		default:
@@ -108,6 +110,9 @@ func (t *Task) Marshal() string {
 	kv("worktree", quote(t.Worktree))
 	kv("agent", quote(t.Agent))
 	kv("branch", quote(t.Branch))
+	if t.Question != "" {
+		kv("question", quote(t.Question))
+	}
 	if !t.Completed.IsZero() {
 		kv("completed", fmtTime(t.Completed))
 	}
