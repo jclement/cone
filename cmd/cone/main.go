@@ -698,6 +698,12 @@ func cmdAsk(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Refuse BEFORE the POST. A done task cannot be blocked, so the question would be filed
+	// on the human's phone and then dangle forever — the sweep only watches blocked/, and
+	// nothing would ever deliver the answer.
+	if t.State == board.Done {
+		return fmt.Errorf("%s is done — an answer would have no task to come back to. File a new task and ask about that", t.ID)
+	}
 	svc, err := human.Configured()
 	if err != nil {
 		return err

@@ -18,7 +18,7 @@ import (
 
 // askFixture is a board holding one ready task, and a human service whose question GET
 // answers with the given status.
-func askFixture(t *testing.T, status, value string) (b *board.Board, taskID string) {
+func askFixture(t *testing.T, status, value string) (b *board.Board, taskID string, posted *int) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("CONE_HOME", home)
@@ -34,8 +34,10 @@ func askFixture(t *testing.T, status, value string) (b *board.Board, taskID stri
 		t.Fatal(err)
 	}
 
+	posted = new(int)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			*posted++
 			var q map[string]any
 			json.NewDecoder(r.Body).Decode(&q)
 			// The context must carry the way back to the board.
@@ -55,11 +57,11 @@ func askFixture(t *testing.T, status, value string) (b *board.Board, taskID stri
 	cfg := filepath.Join(t.TempDir(), "human.json")
 	os.WriteFile(cfg, []byte(`{"name":"svc","url":"`+srv.URL+`","token":"t"}`), 0o644)
 	t.Setenv("CONE_HUMAN", cfg)
-	return b, task.ID
+	return b, task.ID, posted
 }
 
 func TestAskRecordsTheQuestionAndBlocksTheTask(t *testing.T) {
-	b, id := askFixture(t, "open", "")
+	b, id, _ := askFixture(t, "open", "")
 
 	err := cmdAsk([]string{id, "-title", "which strategy?", "-body", "the two diffs"})
 	if err != nil {
@@ -83,7 +85,7 @@ func TestAskRecordsTheQuestionAndBlocksTheTask(t *testing.T) {
 // Durability first: with no service configured the command explains what to create and
 // touches nothing — it must not invent a URL and must not move the task.
 func TestAskWithoutAServiceExplainsAndTouchesNothing(t *testing.T) {
-	b, id := askFixture(t, "open", "")
+	b, id, _ := askFixture(t, "open", "")
 	t.Setenv("CONE_HUMAN", filepath.Join(t.TempDir(), "absent.json"))
 
 	err := cmdAsk([]string{id, "-title", "x", "-body", "y"})
@@ -98,7 +100,7 @@ func TestAskWithoutAServiceExplainsAndTouchesNothing(t *testing.T) {
 
 // --wait must land in the same end state the sweep produces: answer noted, task ready.
 func TestAskWaitDeliversTheAnswer(t *testing.T) {
-	b, id := askFixture(t, "answered", "go with plan b")
+	b, id, _ := askFixture(t, "answered", "go with plan b")
 
 	if err := cmdAsk([]string{id, "-title", "which?", "-body", "diffs", "-wait"}); err != nil {
 		t.Fatal(err)
@@ -115,7 +117,7 @@ func TestAskWaitDeliversTheAnswer(t *testing.T) {
 // Expiry is not consent: --wait must exit non-zero, say so on the task, and leave it blocked
 // for the asker to report rather than quietly requeueing it.
 func TestAskWaitExpiryIsLoudAndLeavesTheTaskBlocked(t *testing.T) {
-	b, id := askFixture(t, "expired", "")
+	b, id, _ := askFixture(t, "expired", "")
 
 	err := cmdAsk([]string{id, "-title", "which?", "-body", "diffs", "-wait"})
 	if err == nil || !strings.Contains(err.Error(), "expiry is not consent") {
@@ -130,11 +132,34 @@ func TestAskWaitExpiryIsLoudAndLeavesTheTaskBlocked(t *testing.T) {
 	}
 }
 
+// A done task cannot be blocked, so its question could never be delivered — it would dangle
+// on the human's phone forever. The refusal must come before anything leaves the machine.
+func TestAskRefusesADoneTaskBeforePosting(t *testing.T) {
+	b, id, posted := askFixture(t, "open", "")
+	if _, err := b.Claim(id, "worker"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CompleteWith(id, "already finished"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cmdAsk([]string{id, "-title", "too late?", "-body", "the work is done"})
+	if err == nil || !strings.Contains(err.Error(), "done") {
+		t.Fatalf("asking about a done task got %v, want a refusal", err)
+	}
+	if *posted != 0 {
+		t.Fatalf("the question was posted %d time(s) before the refusal — it now dangles on the human's phone", *posted)
+	}
+	if got, _ := b.Find(id); got.Question != "" {
+		t.Fatalf("a refused ask still stamped question %q", got.Question)
+	}
+}
+
 // --help must be answered, and a mistyped flag refused — not folded into the positionals and
 // posted to a human's phone as a question about a task named "--help". Same contract as
 // `cone new`, for the same reason: this command's mistyped argument leaves the machine.
 func TestAskAnswersHelpAndRefusesUnknownFlags(t *testing.T) {
-	b, id := askFixture(t, "open", "")
+	b, id, _ := askFixture(t, "open", "")
 
 	out, err := captureStdout(t, func() error { return cmdAsk([]string{"--help"}) })
 	if err != nil || !strings.Contains(out, "usage: cone ask") {
@@ -152,7 +177,7 @@ func TestAskAnswersHelpAndRefusesUnknownFlags(t *testing.T) {
 // The contract's decision kinds need a recommendation, and the refusal must happen before
 // anything is posted or the task is touched.
 func TestAskRejectsAChoiceWithoutARecommendationLocally(t *testing.T) {
-	b, id := askFixture(t, "open", "")
+	b, id, _ := askFixture(t, "open", "")
 
 	err := cmdAsk([]string{id, "-title", "which?", "-body", "diffs", "-kind", "choice",
 		"-option", "a:plan a", "-option", "b:plan b"})

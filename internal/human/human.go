@@ -303,6 +303,13 @@ func snippet(r io.Reader) string {
 // kept verbatim; the note heading carries the question id, which is also what marks the
 // question as applied so the sweep never delivers the same answer twice. The question key on
 // the frontmatter is deliberately kept — it is the task's history.
+//
+// The RELEASE HAPPENS FIRST, and the order is load-bearing. Note-then-release left a two-call
+// window where a crash produced a task in blocked/ whose body already carried the applied
+// marker — which the sweep and doctor both skip, so it was stranded silently and permanently.
+// Release-then-note fails the other way: a task in ready/ with the answer not yet noted, which
+// is merely degraded — a lead is offered it, the Asked note carries the question URL, and if it
+// is ever blocked again the sweep re-fetches and finally notes the still-unapplied answer.
 func Answered(b *board.Board, taskID, questionID string, ans *Answer) (*board.Task, error) {
 	text := strings.TrimSpace(ans.Value)
 	if strings.TrimSpace(ans.Note) != "" {
@@ -314,28 +321,28 @@ func Answered(b *board.Board, taskID, questionID string, ans *Answer) (*board.Ta
 	if text == "" {
 		text = "(answered with no text)"
 	}
-	t, err := b.Note(taskID, appliedHeading(StatusAnswered, questionID), text)
-	if err != nil {
-		return nil, err
-	}
-	if t.State == board.Blocked {
-		return b.Release(taskID)
-	}
-	return t, nil
+	return settle(b, taskID, appliedHeading(StatusAnswered, questionID), text)
 }
 
 // Unanswered records that a question settled without an answer and returns the task to ready
 // so a lead re-triages it with eyes open. Expiry is not consent: the task comes back for a
 // decision, never as authorisation to proceed.
 func Unanswered(b *board.Board, taskID, questionID, status string) (*board.Task, error) {
-	t, err := b.Note(taskID, appliedHeading(status, questionID), UnansweredNote(questionID, status))
+	return settle(b, taskID, appliedHeading(status, questionID), UnansweredNote(questionID, status))
+}
+
+// settle is the shared release-then-note ordering — see Answered for why that order.
+func settle(b *board.Board, taskID, heading, text string) (*board.Task, error) {
+	t, err := b.Find(taskID)
 	if err != nil {
 		return nil, err
 	}
 	if t.State == board.Blocked {
-		return b.Release(taskID)
+		if _, err := b.Release(taskID); err != nil {
+			return nil, err
+		}
 	}
-	return t, nil
+	return b.Note(taskID, heading, text)
 }
 
 // UnansweredNote is the text recorded when a question settles with nothing.

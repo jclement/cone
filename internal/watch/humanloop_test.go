@@ -168,16 +168,18 @@ func TestAnUnreachableHumanServiceDoesNotBreakTheTick(t *testing.T) {
 	}
 }
 
-// The launchd unit runs `cone watch`; nothing runs `cone sync`. The tick is what makes a task
-// queued from a phone actually arrive.
-func TestTheTickPullsConfiguredInboxes(t *testing.T) {
-	served := false
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if served {
+// phoneQueue fakes a claim-style inbox: it hands out one task, then reports empty. hits
+// counts requests, because a claim is destructive upstream — a caller that should not be
+// claiming must be shown to have never called.
+func phoneQueue(t *testing.T) (srv *httptest.Server, hits *int) {
+	t.Helper()
+	hits = new(int)
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*hits++
+		if *hits > 1 {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		served = true
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{
 			"id": "mp-7", "title": "from the phone", "body": "queued remotely",
 		}})
@@ -186,7 +188,13 @@ func TestTheTickPullsConfiguredInboxes(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "inboxes.json")
 	os.WriteFile(cfg, []byte(`[{"name":"phone","url":"`+srv.URL+`","claim_path":"/claim","token":"t"}]`), 0o644)
 	t.Setenv("CONE_INBOXES", cfg)
+	return srv, hits
+}
 
+// The launchd unit runs `cone watch`; nothing runs `cone sync`. The tick is what makes a task
+// queued from a phone actually arrive.
+func TestTheTickPullsConfiguredInboxes(t *testing.T) {
+	phoneQueue(t)
 	b, _ := board.Open(t.TempDir())
 	bin, _ := fakeHerdr(t, agents())
 	w := New(b, Options{HerdrBin: bin})
@@ -199,5 +207,23 @@ func TestTheTickPullsConfiguredInboxes(t *testing.T) {
 	}
 	if inboxed[0].SourceRef != "mp-7" {
 		t.Fatalf("filed the wrong thing: %+v", inboxed[0])
+	}
+}
+
+// A claim on these endpoints is destructive upstream, so --dry-run must not merely refrain
+// from filing — it must never call the service at all.
+func TestADryRunTickClaimsNothingFromAnInbox(t *testing.T) {
+	_, hits := phoneQueue(t)
+	b, _ := board.Open(t.TempDir())
+	bin, _ := fakeHerdr(t, agents())
+	w := New(b, Options{HerdrBin: bin, DryRun: true})
+
+	w.Tick(context.Background())
+
+	if *hits != 0 {
+		t.Fatalf("a dry-run tick claimed from the inbox %d time(s) — that claim destroyed the human's queue entry", *hits)
+	}
+	if inboxed, _ := b.List(board.Inbox); len(inboxed) != 0 {
+		t.Fatalf("a dry-run tick filed %d task(s)", len(inboxed))
 	}
 }
