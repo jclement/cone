@@ -238,9 +238,10 @@ const newUsage = `usage: cone new [flags] <title>
 // reject arguments the parser was about to accept. Everything after -- is title text and is
 // not inspected, which is what keeps a title legitimately able to begin with a dash.
 //
-// Only `new` uses this. The permissiveness is right for the commands that merely read or
-// annotate ("-1 was the culprit" is a finding, not a flag); it is wrong for the one command
-// whose mistyped argument becomes a new row on the board.
+// `new` and `ask` use this. The permissiveness is right for the commands that merely read or
+// annotate ("-1 was the culprit" is a finding, not a flag); it is wrong for a command whose
+// mistyped argument becomes a new row on the board — or, for `ask`, a question posted to a
+// human's phone about a task id spelled "--help".
 func helpOrUnknownFlag(fs *flag.FlagSet, args []string) (help bool, err error) {
 	known, isBool := map[string]bool{}, map[string]bool{}
 	fs.VisitAll(func(f *flag.Flag) {
@@ -263,7 +264,7 @@ func helpOrUnknownFlag(fs *flag.FlagSet, args []string) (help bool, err error) {
 		case name == "h" || name == "help":
 			return true, nil
 		case !known[name]:
-			return false, fmt.Errorf("unknown flag %q — see cone new --help, or put it after -- to make it part of the title", a)
+			return false, fmt.Errorf("unknown flag %q — see cone %s --help, or put it after -- to take it literally", a, fs.Name())
 		case !hasValue && !isBool[name] && i+1 < len(args):
 			i++
 		}
@@ -661,6 +662,13 @@ func cmdAsk(args []string) error {
 		fmt.Print(askUsage)
 		fs.SetOutput(os.Stdout)
 		fs.PrintDefaults()
+	}
+	switch help, err := helpOrUnknownFlag(fs, args); {
+	case err != nil:
+		return err
+	case help:
+		fs.Usage()
+		return nil
 	}
 	fs.Parse(reorder(fs, args))
 	if fs.NArg() == 0 {

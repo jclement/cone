@@ -130,6 +130,25 @@ func TestAskWaitExpiryIsLoudAndLeavesTheTaskBlocked(t *testing.T) {
 	}
 }
 
+// --help must be answered, and a mistyped flag refused — not folded into the positionals and
+// posted to a human's phone as a question about a task named "--help". Same contract as
+// `cone new`, for the same reason: this command's mistyped argument leaves the machine.
+func TestAskAnswersHelpAndRefusesUnknownFlags(t *testing.T) {
+	b, id := askFixture(t, "open", "")
+
+	out, err := captureStdout(t, func() error { return cmdAsk([]string{"--help"}) })
+	if err != nil || !strings.Contains(out, "usage: cone ask") {
+		t.Fatalf("--help got (%q, %v), want usage", out, err)
+	}
+	if err := cmdAsk([]string{id, "-title", "t", "-body", "b", "--dry-run"}); err == nil {
+		t.Fatal("an unknown flag was accepted")
+	}
+	got, _ := b.Find(id)
+	if got.State != board.Ready || got.Question != "" {
+		t.Fatalf("a refused ask still changed the task: state=%s question=%q", got.State, got.Question)
+	}
+}
+
 // The contract's decision kinds need a recommendation, and the refusal must happen before
 // anything is posted or the task is touched.
 func TestAskRejectsAChoiceWithoutARecommendationLocally(t *testing.T) {
